@@ -1,0 +1,17 @@
+{
+  "name": "discord_dm",
+  "version": "1.0.0",
+  "description": "Discord bot 组件试用/demo脚本——embed、按钮、webhook、斜杠指令，探索出的用法后来接进了 scooter-dm-helper 的 furniture_watch.mjs",
+  "main": "demo.mjs",
+  "scripts": {
+    "demo": "node demo.mjs",
+    "listen": "node listen.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "discord.js": "^14.27.0"
+  }
+}
