@@ -335,7 +335,8 @@ async function handleCommand(line) {
           type: ChannelType.GuildForum,
           availableTags: [...STATUS_TAGS, ...DOMAIN_TAGS].map((name) => ({ name })),
         });
-        console.log(`已创建论坛频道 "${rest}"，ID: ${created.id}\n把这个ID填进 .env 的 DISCORD_FORUM_CHANNEL_ID，然后重启脚本。`);
+        forumChannel = created; // 当前这次运行立刻可用，不用等重启就能 post 测试；但重启后要读.env，记得填DISCORD_FORUM_CHANNEL_ID
+        console.log(`已创建论坛频道 "${rest}"，ID: ${created.id}\n把这个ID填进 .env 的 DISCORD_FORUM_CHANNEL_ID，下次重启才会自动用它(这次运行已经可以直接 post 测试)。`);
       } catch (e) {
         console.error("创建失败:", e.message);
       }
