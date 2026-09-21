@@ -25,6 +25,29 @@ node discord_dm.mjs    # 常驻运行 + 交互式控制台
 
 需要一个已经加进目标服务器、有发消息/管理webhook权限的Discord bot token。
 
+## 论坛频道(forum channel)：一个帖子对应外部程序的一个任务
+
+普通频道是一条条消息按时间线往下排，长任务的历史记录/多任务并行状态很难看清楚。论坛频道
+(forum channel)是另一种频道类型：打开是一排"帖子"(post，每个帖子本身就是一个thread)，
+每个帖子有标题、标签(tag)、独立的消息列表——很适合"一个任务/goal对应一个帖子，标签表示进行中/
+暂停/已完成"这种场景。
+
+这个能力是可选的，不配`DISCORD_FORUM_CHANNEL_ID`就跟以前一样只用普通频道。启用步骤：
+
+```bash
+node discord_dm.mjs
+> mkforum 任务面板     # 建一个论坛频道，自带默认标签(状态3个 + 领域10个)，打印出频道ID
+# 把打印出来的ID填进 .env 的 DISCORD_FORUM_CHANNEL_ID，重启脚本
+> post 测试任务 | 这是帖子正文   # 手动发一个帖子测试效果
+```
+
+外部程序对接靠 `outbox.jsonl` 里三种新格式(建帖子`new_forum_post` / 往帖子里发消息`thread_id`+
+`text` / 改标签`thread_id`+`set_tags`)，详见`discord_dm.mjs`文件头注释。建帖子后脚本会往
+`inbox.jsonl`写一条`forum_post_created`回执带上`thread_id`，外部程序要自己存住这个ID，后续
+往这个帖子发消息/改标签都要用它。
+
+需要bot在目标服务器有"管理频道"(建论坛频道用)和"创建帖子/管理帖子"权限。
+
 ## 历史/demo脚本(不是生产代码，留着当参考)
 
 - `demo.mjs` —— 最早挨个试Discord bot几种组件时写的：纯文字消息、富文本卡片(embed)、
