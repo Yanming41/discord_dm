@@ -47,6 +47,15 @@
 //   6) 更新一个帖子的标签(状态变化/转接给别的领域)：
 //      {"thread_id":"...", "set_tags": {"status_tag":"已完成", "domain_tag":"..."}}  // 两个字段都可选，只传要改的
 //
+// ---------- 远程睡眠(不是业务转发，是控制本机的内置功能) ----------
+// 在配置的频道里发一条内容是"睡眠"或"sleep"(不分大小写、前后空格不管)的消息，本脚本会先回复
+// 确认，再调用系统命令让本机进入睡眠(S3)。这不走outbox/inbox，是直接监听消息触发，因为"让
+// 运行本脚本的这台机器睡眠"是本机自身的控制动作，不是要转发给外部程序的业务消息。
+// 需要在.env配置DISCORD_OWNER_ID(你自己的Discord用户ID)，只有这个人发的消息才会触发，防止
+// 频道里其他人(如果频道不是纯私人的)把你电脑睡眠掉。不配DISCORD_OWNER_ID的话，频道里任何人
+// 发触发词都会生效，仅建议在确定只有自己能看到这个频道时这样用。
+// 另外要在Discord开发者后台给这个bot开一下"MESSAGE CONTENT INTENT"开关，不然收不到消息内容。
+//
 // inbox 一行格式(按钮被点击时)：
 //   {
 //     "type": "button_click", "custom_id": "interested_xxx",
@@ -74,6 +83,7 @@ import {
 } from "discord.js";
 import { readFile, appendFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { exec } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline";
@@ -83,15 +93,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUTBOX_FILE = path.join(__dirname, "outbox.jsonl");
 const INBOX_FILE = path.join(__dirname, "inbox.jsonl");
 const POLL_MS = 3000; // Discord没有微信那种"会话窗口"限制，不用像wx_dm那样费劲上fs.watch，轮询就够快了
+const SLEEP_TRIGGERS = new Set(["睡眠", "sleep"]); // 消息内容(trim后、忽略大小写)精确匹配这两个词才触发
 
 const env = await loadEnv();
-const { DISCORD_TOKEN, DISCORD_CHANNEL_ID, DISCORD_GUILD_ID, DISCORD_FORUM_CHANNEL_ID } = env;
+const { DISCORD_TOKEN, DISCORD_CHANNEL_ID, DISCORD_GUILD_ID, DISCORD_FORUM_CHANNEL_ID, DISCORD_OWNER_ID } = env;
 if (!DISCORD_TOKEN || !DISCORD_CHANNEL_ID) {
   throw new Error("缺 .env 配置，检查 DISCORD_TOKEN / DISCORD_CHANNEL_ID");
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 let channel = null;
@@ -274,6 +290,23 @@ client.on("interactionCreate", async (interaction) => {
     }) + "\n",
     "utf-8"
   );
+});
+
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+  if (message.channelId !== DISCORD_CHANNEL_ID) return; // 只在配置的这个频道里生效
+  if (DISCORD_OWNER_ID && message.author.id !== DISCORD_OWNER_ID) return; // 配了就锁死只有本人能触发
+  const content = message.content.trim().toLowerCase();
+  if (!SLEEP_TRIGGERS.has(content)) return;
+
+  try {
+    await message.reply("好，准备睡眠了，晚安 😴"); // 必须等这条确认消息真的发出去了，网络马上就要断了
+    exec("rundll32.exe powrprof.dll,SetSuspendState 0,1,0");
+    stats.sent++;
+  } catch (e) {
+    stats.errors++;
+    console.error("[睡眠] 触发失败:", e.message);
+  }
 });
 
 // ---------- 交互式控制台：跟服务同一个进程/同一个终端，敲命令立刻生效 ----------
