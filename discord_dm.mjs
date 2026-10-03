@@ -47,6 +47,11 @@
 //   6) 更新一个帖子的标签(状态变化/转接给别的领域)：
 //      {"thread_id":"...", "set_tags": {"status_tag":"已完成", "domain_tag":"..."}}  // 两个字段都可选，只传要改的
 //
+// inbox 里还会有两类事件：
+//   {"type":"message", "channel_id", "thread_id"(主频道为null，论坛帖子里为帖子ID), "content", "author_id", "message_id", "ts"}
+//     —— 配置频道或论坛帖子里 DISCORD_OWNER_ID 本人发的消息(睡眠关键词除外)
+//   {"type":"forum_post_created", "ref", "thread_id", "title", "ts"} —— 格式4建帖子的回执
+//
 // ---------- 远程睡眠(不是业务转发，是控制本机的内置功能) ----------
 // 在配置的频道里发一条内容是"睡眠"或"sleep"(不分大小写、前后空格不管)的消息，本脚本会先回复
 // 确认，再调用系统命令让本机进入睡眠(S3)。这不走outbox/inbox，是直接监听消息触发，因为"让
@@ -294,19 +299,38 @@ client.on("interactionCreate", async (interaction) => {
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
-  if (message.channelId !== DISCORD_CHANNEL_ID) return; // 只在配置的这个频道里生效
   if (DISCORD_OWNER_ID && message.author.id !== DISCORD_OWNER_ID) return; // 配了就锁死只有本人能触发
-  const content = message.content.trim().toLowerCase();
-  if (!SLEEP_TRIGGERS.has(content)) return;
 
-  try {
-    await message.reply("好，准备睡眠了，晚安 😴"); // 必须等这条确认消息真的发出去了，网络马上就要断了
-    exec("rundll32.exe powrprof.dll,SetSuspendState 0,1,0");
-    stats.sent++;
-  } catch (e) {
-    stats.errors++;
-    console.error("[睡眠] 触发失败:", e.message);
+  const inMainChannel = message.channelId === DISCORD_CHANNEL_ID;
+  const inForumThread = Boolean(DISCORD_FORUM_CHANNEL_ID) && message.channel.isThread() && message.channel.parentId === DISCORD_FORUM_CHANNEL_ID;
+  if (!inMainChannel && !inForumThread) return;
+
+  const content = message.content.trim();
+  if (inMainChannel && SLEEP_TRIGGERS.has(content.toLowerCase())) {
+    try {
+      await message.reply("好，准备睡眠了，晚安 😴"); // 必须等这条确认消息真的发出去了，网络马上就要断了
+      exec("rundll32.exe powrprof.dll,SetSuspendState 0,1,0");
+      stats.sent++;
+    } catch (e) {
+      stats.errors++;
+      console.error("[睡眠] 触发失败:", e.message);
+    }
+    return;
   }
+
+  await appendFile(
+    INBOX_FILE,
+    JSON.stringify({
+      type: "message",
+      channel_id: message.channelId,
+      thread_id: inForumThread ? message.channelId : null,
+      content,
+      message_id: message.id,
+      author_id: message.author.id,
+      ts: Date.now(),
+    }) + "\n",
+    "utf-8"
+  );
 });
 
 // ---------- 交互式控制台：跟服务同一个进程/同一个终端，敲命令立刻生效 ----------
@@ -444,6 +468,11 @@ client.once("clientReady", async () => {
     } catch (e) {
       console.error("[forum] 论坛频道初始化失败:", e.message);
     }
+  }
+
+  // 启动时跳过 outbox 里已有的历史行，否则重启会把以前的消息(包括建帖子指令)全部重发一遍
+  if (existsSync(OUTBOX_FILE)) {
+    outboxLinesProcessed = (await readFile(OUTBOX_FILE, "utf-8")).split("\n").filter(Boolean).length;
   }
 
   setInterval(checkOutbox, POLL_MS);
