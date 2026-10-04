@@ -3,3 +3,4 @@ node_modules/
 *.log
 outbox.jsonl
 inbox.jsonl
+outbox.cursor

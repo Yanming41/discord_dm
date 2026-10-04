@@ -86,8 +86,8 @@ import {
   AttachmentBuilder,
   ChannelType,
 } from "discord.js";
-import { readFile, appendFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { readFile, appendFile, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import { exec } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -117,7 +117,18 @@ const client = new Client({
 
 let channel = null;
 let forumChannel = null; // 可选：DISCORD_FORUM_CHANNEL_ID 配了才会有，论坛帖子(thread)相关能力见下方
-let outboxLinesProcessed = 0;
+// 已发送到outbox第几行，存在游标文件里——之前是每次启动都从0开始，重启一次就把整个outbox历史
+// (旧测试消息、旧失败提醒、旧帖子卡片)重发一遍，2026-09-28重启几次就刷屏了上百条。
+// 没有游标文件(第一次跑)就对齐到文件当前末尾，不回放历史；进程停着期间新写进去的会在重启后补发。
+const OUTBOX_CURSOR_FILE = path.join(__dirname, "outbox.cursor");
+function loadOutboxCursor() {
+  try {
+    return parseInt(readFileSync(OUTBOX_CURSOR_FILE, "utf-8"), 10) || 0;
+  } catch {
+    return existsSync(OUTBOX_FILE) ? readFileSync(OUTBOX_FILE, "utf-8").split("\n").filter(Boolean).length : 0;
+  }
+}
+let outboxLinesProcessed = loadOutboxCursor();
 
 // ---------- 论坛频道(forum channel)默认标签(tag) ----------
 // 状态类标签跟帖子(thread)一一对应，只应用一个；领域标签取自个性化pi agent(frontdesk扩展)
@@ -277,6 +288,7 @@ async function checkOutbox() {
     }
   }
   outboxLinesProcessed = lines.length;
+  await writeFile(OUTBOX_CURSOR_FILE, String(outboxLinesProcessed), "utf-8");
 }
 
 client.on("interactionCreate", async (interaction) => {
@@ -470,13 +482,15 @@ client.once("clientReady", async () => {
     }
   }
 
-  // 启动时跳过 outbox 里已有的历史行，否则重启会把以前的消息(包括建帖子指令)全部重发一遍
-  if (existsSync(OUTBOX_FILE)) {
-    outboxLinesProcessed = (await readFile(OUTBOX_FILE, "utf-8")).split("\n").filter(Boolean).length;
-  }
-
   setInterval(checkOutbox, POLL_MS);
-  startConsole();
+  // stdin不是真正的TTY时(比如后台常驻跑、没有交互终端)，readline的close事件会在stdin
+  // 收到EOF那一刻立刻触发，把整个client.destroy()掉——这种环境下命令行本来也用不了，
+  // 干脆不启动，只保留outbox轮询这个真正要长期跑的部分。
+  if (process.stdin.isTTY) {
+    startConsole();
+  } else {
+    console.log("[discord_dm] 非交互环境，跳过命令行控制台，只跑outbox轮询");
+  }
 });
 
 await client.login(DISCORD_TOKEN);
