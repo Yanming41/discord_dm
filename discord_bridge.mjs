@@ -5,7 +5,8 @@
 // 主频道：  /cc 标题        开一个新会话(论坛里新建帖子 + dinotty 里新开一个跑 claude 的标签页)
 //           /sessions      列出本机最近的 Claude 会话(包括在终端里直接开的)
 //           /resume 编号   把列表里的某个会话接到一个新帖子里(在它原来的目录里 claude --resume)
-//           /list          看已绑定的会话      /help  看用法
+//           /list          看已绑定的会话
+//           /help [主题]   操作手册(sessions/chat/commands/faq/other；all 看全部；pin 置顶到主频道)
 // 帖子里：  直接发消息 → 转给这个帖子的 Claude
 //           /stop 中止当前任务 · /end 结束会话 · /screen 看终端画面 · /clear 换一个全新会话
 //           /compact /model /effort /context /cost 原样转发 · /mode 用 Shift+Tab 切权限模式
@@ -463,21 +464,132 @@ function enqueue(threadId, job) {
   queues.set(threadId, next);
 }
 
-const MAIN_HELP = [
-  "**Claude Code 桥接 · 主频道**",
-  "`/cc 标题` 开一个新会话 · `/sessions` 列出本机最近的 Claude 会话 · `/resume 编号` 把其中一个接到新帖子里",
-  "`/list` 看已绑定的会话 · `/help` 帮助",
-].join("\n");
+// ---------- 操作手册：/help 看总览，/help 主题 看细节 ----------
 
 const THREAD_HELP = [
   "**会话帖子里**：直接发消息就是跟 Claude 说话",
   "`/stop` 中止当前任务 · `/end` 结束会话并关掉终端 · `/screen` 看终端当前画面",
-  "`/clear` 开一个全新会话(旧的还能 /resume 找回) · `/compact` 压缩上下文",
-  "`/model 名字` · `/effort 档位` · `/context` · `/cost` · `/mode plan|auto|accept|default`",
-  "状态：👀 收到 → ⏳ 处理中 → ✅ 完成 / ❌ 出错，处理期间有一条进度消息实时刷新。",
+  "`/clear` 开一个全新会话 · `/compact` 压缩上下文 · `/mode plan|auto|accept|default`",
+  "更多用法发 `/help`",
 ].join("\n");
 
-const HELP = `${MAIN_HELP}\n\n${THREAD_HELP}`;
+const HELP_TOPICS = {
+  sessions: {
+    aliases: ["会话", "session"],
+    title: "会话：开新的、接旧的",
+    body: [
+      "一个论坛帖子 = 一个 Claude Code 会话 = dinotty 里一个终端标签页。下面这些都在**主频道**发：",
+      "• `/cc 标题` — 开一个全新会话，论坛里会多一个 `[cc] 标题` 的帖子，等它说「🟢 已就绪」再聊",
+      "• `/sessions` — 列出本机最近 10 个 Claude 会话(包括你在电脑终端里开的)，带标题、最后一句、目录、时间",
+      "• `/resume 编号` — 把列表里的某个会话接到一个新帖子里，之前的上下文都在",
+      "• `/resume 编号!` — 标了 ⚠️ 的会话(5 分钟内还在更新，可能正开在别处)要加 `!` 确认才接",
+      "• `/list` — 看现在绑定了哪些帖子、各自是 🟢空闲 / ⏳工作中 / ⚪终端未启动",
+      `同时最多 ${MAX_SESSIONS} 个会话。用完在帖子里发 \`/end\`，对话记录会保留，之后还能 \`/resume\` 回来。`,
+    ],
+  },
+  chat: {
+    aliases: ["聊天", "状态", "status"],
+    title: "聊天和状态显示",
+    body: [
+      "在会话帖子里直接发消息，就是在跟这个帖子的 Claude 说话；多行消息会整体发过去。",
+      "**你的消息上的表情**：👀 收到 → ⏳ 处理中 → ✅ 完成 / ❌ 出错 / ⏹️ 已中止",
+      "**进度消息**：处理期间每 5 秒刷新一次，显示已用时间和最近 5 个动作(读了哪个文件、跑了什么命令)，结束后变成「✅ 完成 · 用时 · 工具调用次数」。",
+      "**帖子标签**：进行中 / 等待中 / 已完成，在论坛列表里一眼看到哪个会话在跑。",
+      "Claude 在干活时你又发了消息，会排队，等这轮结束再发给它。想打断用 `/stop`。",
+    ],
+  },
+  commands: {
+    aliases: ["指令", "命令", "cmd"],
+    title: "帖子里能用的 Claude Code 指令",
+    body: [
+      "**原样转发给 Claude**(输出会发回帖子)：",
+      "• `/compact` 压缩上下文(可能要等几分钟)",
+      "• `/model 名字` 换模型，例如 `/model sonnet`、`/model opus`",
+      "• `/effort 档位` 调思考强度，例如 `/effort high`",
+      "• `/context` 看上下文占用 · `/cost` 看花费",
+      "**桥接自己实现**：",
+      "• `/mode plan|auto|accept|default` 切权限模式(plan=只规划不动手，auto=自动模式，accept=自动接受编辑)",
+      "• `/clear` 在同一个帖子里换一个全新会话(旧会话没删，可以 `/resume` 找回)",
+      "• `/screen` 把终端当前画面发回来，任何情况都能先看一眼",
+      "• `/stop` 中止当前任务 · `/end` 结束会话、关掉终端",
+      "**Discord 里用不了**：`/permissions` `/mcp` `/config` `/rewind` 这类会弹出选择界面的，请到 dinotty 的标签页里操作。`/model` `/effort` 不带参数也会弹选择框，所以必须带参数。",
+    ],
+  },
+  faq: {
+    aliases: ["问题", "排错", "troubleshoot"],
+    title: "常见问题",
+    body: [
+      "• **发了消息没反应**：看消息上有没有 👀。没有的话先确认是在会话帖子里发的，再在主频道发 `/list` 看会话还在不在。",
+      "• **提示 Claude 在等权限确认**：到 dinotty 对应的 cc-bridge 标签页里选一下，或者回复 `/stop` 放弃这一步。",
+      "• **终端启动失败 / 90 秒没就绪**：发 `/screen` 看卡在哪个界面；dinotty 没开的话先把它打开。",
+      "• **电脑重启过**：不用管，下一条消息会自动重开终端并接上原来的对话。",
+      "• **超过 30 分钟还没结束**：桥接不再等了，但 Claude 可能还在跑，`/screen` 或 dinotty 里看进度。",
+      "• **resume 时提示还在更新**：那个会话可能正开在电脑终端里，两边同时用会把记录写乱。确认没在用再 `/resume 编号!`。",
+    ],
+  },
+  other: {
+    aliases: ["其他", "睡眠", "sleep"],
+    title: "其他功能",
+    body: [
+      "• 在**主频道**发 `睡眠` 或 `sleep`：电脑会回一句晚安，然后进入睡眠。",
+      "• 只有你本人(DISCORD_OWNER_ID)发的消息才会被处理，别人发的指令会被忽略。",
+      "• pi agent(2B)还没接进来，接好之后会有对应的 `/2b` 指令。",
+    ],
+  },
+};
+
+function helpOverview() {
+  return [
+    "**📖 Discord ↔ Claude Code 操作手册**",
+    "",
+    "**快速上手**",
+    "1. 主频道发 `/cc 标题` 开一个会话(或 `/sessions` + `/resume 编号` 接上以前的会话)",
+    "2. 进入论坛里新出现的 `[cc] 标题` 帖子，等它说「🟢 已就绪」",
+    "3. 直接在帖子里说话；表情和进度消息会告诉你 Claude 在干什么",
+    "",
+    "**详细说明**：发 `/help 主题`",
+    ...Object.entries(HELP_TOPICS).map(([key, t]) => `• \`/help ${key}\`(${t.aliases[0]}) — ${t.title}`),
+    "",
+    "`/help all` 一次看全部 · `/help pin` 把这份手册置顶到主频道",
+  ].join("\n");
+}
+
+function findHelpTopic(name) {
+  const n = name.toLowerCase();
+  return Object.entries(HELP_TOPICS).find(([key, t]) => key === n || t.aliases.includes(n))?.[1] ?? null;
+}
+
+const renderTopic = (t) => `**${t.title}**\n${t.body.join("\n")}`;
+
+async function pinManual() {
+  const content = helpOverview();
+  if (state.manualMessageId) {
+    try {
+      await discord("PATCH", `/channels/${DISCORD_CHANNEL_ID}/messages/${state.manualMessageId}`, { content, allowed_mentions: NO_MENTIONS });
+      await discord("PUT", `/channels/${DISCORD_CHANNEL_ID}/pins/${state.manualMessageId}`);
+      await postMessage(DISCORD_CHANNEL_ID, "置顶的操作手册已更新。点频道右上角的 📌 就能看到。", toMain);
+      return;
+    } catch {
+      // 之前置顶的那条被删了，重新发一条
+    }
+  }
+  const m = await postMessage(DISCORD_CHANNEL_ID, content, toMain);
+  await discord("PUT", `/channels/${DISCORD_CHANNEL_ID}/pins/${m.id}`);
+  state.manualMessageId = m.id;
+  await saveState();
+}
+
+async function showHelp(channelId, arg, opts) {
+  const topic = arg.trim();
+  if (!topic) return postMessage(channelId, helpOverview(), opts);
+  if (topic === "pin") return pinManual();
+  if (topic === "all") {
+    return postLong(channelId, Object.values(HELP_TOPICS).map(renderTopic).join("\n\n"), opts);
+  }
+  const t = findHelpTopic(topic);
+  if (!t) return postMessage(channelId, `没有「${topic}」这个主题。\n\n${helpOverview()}`, opts);
+  return postMessage(channelId, renderTopic(t), opts);
+}
 
 function sessionLimitReached() {
   return Object.keys(state.sessions).length >= MAX_SESSIONS;
@@ -824,7 +936,8 @@ async function handleMessage(ev) {
   if (text === "/resume") return postMessage(DISCORD_CHANNEL_ID, "用法：先 `/sessions` 看列表，再 `/resume 编号`。", toMain);
   if (text === "/sessions") return showClaudeSessions();
   if (text === "/list") return listSessions();
-  if (text === "/help") return postMessage(DISCORD_CHANNEL_ID, HELP, toMain);
+  const help = text.match(/^\/help(?:\s+(.*))?$/s);
+  if (help) return showHelp(DISCORD_CHANNEL_ID, help[1] ?? "", toMain);
 }
 
 async function handleThreadCommand(s, ev, text) {
@@ -836,7 +949,7 @@ async function handleThreadCommand(s, ev, text) {
     case "/screen":
       return guarded(s, "读终端画面", () => showScreen(s));
     case "/help":
-      return postMessage(s.threadId, THREAD_HELP);
+      return guarded(s, "显示帮助", () => showHelp(s.threadId, arg));
     case "/end":
       return enqueue(s.threadId, () => guarded(s, "结束会话", () => endSession(s)));
     case "/clear":
