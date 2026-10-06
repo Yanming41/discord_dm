@@ -22,6 +22,7 @@ const OUTBOX_FILE = path.join(__dirname, "outbox.jsonl");
 const STATE_FILE = path.join(__dirname, "bridge_state.json");
 const TOKEN_FILE = path.join(os.homedir(), ".discord_dm", "dinotty_agent_token");
 const PANE_FILE = path.join(os.homedir(), ".discord_dm", "dinotty_cc_pane"); // dinotty 重启后 pane 会变，换 pane 只需改这个文件
+const WEBHOOK_FILE = path.join(os.homedir(), ".discord_dm", "cc_webhook_url"); // 有的话 Claude 的回复以 "Claude Code" 身份发出
 
 const DINOTTY = "http://127.0.0.1:8999";
 const POLL_MS = 2000;
@@ -45,6 +46,7 @@ if (!existsSync(PANE_FILE)) {
   throw new Error(`找不到 cc-bridge 的 pane ID 文件: ${PANE_FILE}`);
 }
 const CC_PANE_ID = (await readFile(PANE_FILE, "utf-8")).trim();
+const WEBHOOK_URL = existsSync(WEBHOOK_FILE) ? (await readFile(WEBHOOK_FILE, "utf-8")).trim() : null;
 
 async function readCompleteLines(file) {
   if (!existsSync(file)) return [];
@@ -75,8 +77,25 @@ function splitForDiscord(text) {
   return out;
 }
 
+async function postViaWebhook(chunk) {
+  const res = await fetch(`${WEBHOOK_URL}?thread_id=${state.threadId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: chunk, allowed_mentions: { parse: [] } }),
+  });
+  if (!res.ok) throw new Error(`webhook HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+}
+
 async function postToThread(text) {
   for (const chunk of splitForDiscord(text || "(无输出)")) {
+    if (WEBHOOK_URL) {
+      try {
+        await postViaWebhook(chunk);
+        continue;
+      } catch (e) {
+        console.error("[webhook] 发送失败，改用 bot 发:", e.message);
+      }
+    }
     await outbox({ thread_id: state.threadId, text: chunk });
   }
 }
