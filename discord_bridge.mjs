@@ -538,7 +538,20 @@ const parseJsonLines = (text) =>
     })
     .filter(Boolean);
 
-// 只读文件头尾：头部拿启动目录，尾部拿标题和最后一句(这两类条目会随对话反复追加)
+// claude --resume 要在会话"所属项目"的目录里跑才找得到它；会话中途可能 cd 过，记录里的 cwd
+// 不一定是那个目录。所以在出现过的所有 cwd(和它们的上级目录)里，找名字能对上记录文件夹的那个。
+function resolveSessionCwd(file, cwds) {
+  const want = path.basename(path.dirname(file));
+  for (const c of cwds) {
+    for (let d = c; ; d = path.dirname(d)) {
+      if (d.replace(/[^a-zA-Z0-9]/g, "-") === want) return d;
+      if (path.dirname(d) === d) break;
+    }
+  }
+  return null;
+}
+
+// 只读文件头尾：头尾都拿 cwd，尾部拿标题和最后一句(这两类条目会随对话反复追加)
 async function describeClaudeSession(file, size, mtimeMs) {
   const head = parseJsonLines(await readSlice(file, 0, Math.min(size, 64 * 1024)));
   const tailStart = Math.max(0, size - 256 * 1024);
@@ -551,7 +564,7 @@ async function describeClaudeSession(file, size, mtimeMs) {
   return {
     sessionId: path.basename(file, ".jsonl"),
     file,
-    cwd: head.find((e) => e.cwd)?.cwd ?? tail.find((e) => e.cwd)?.cwd ?? null,
+    cwd: resolveSessionCwd(file, [...new Set(all.map((e) => e.cwd).filter(Boolean))]),
     title: latest("custom-title", "customTitle") ?? latest("ai-title", "aiTitle"),
     lastPrompt: latest("last-prompt", "lastPrompt"),
     mtimeMs,
