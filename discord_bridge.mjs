@@ -96,6 +96,7 @@ function newSession(threadId, title) {
 const state = await loadState();
 for (const s of Object.values(state.sessions)) s.busy = false;
 const saveState = () => writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+await saveState(); // 旧状态迁移完立刻落盘，免得还没收到消息就重启导致迁移结果丢失
 
 // ---------- HTTP ----------
 
