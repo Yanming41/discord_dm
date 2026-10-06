@@ -21,9 +21,9 @@ const INBOX_FILE = path.join(__dirname, "inbox.jsonl");
 const OUTBOX_FILE = path.join(__dirname, "outbox.jsonl");
 const STATE_FILE = path.join(__dirname, "bridge_state.json");
 const TOKEN_FILE = path.join(os.homedir(), ".discord_dm", "dinotty_agent_token");
+const PANE_FILE = path.join(os.homedir(), ".discord_dm", "dinotty_cc_pane"); // dinotty 重启后 pane 会变，换 pane 只需改这个文件
 
 const DINOTTY = "http://127.0.0.1:8999";
-const CC_PANE_ID = "4fd6f661-56f2-4a23-9ebe-06a97aaf9179";
 const POLL_MS = 2000;
 const REPLY_TIMEOUT_MS = 5 * 60 * 1000;
 const CHUNK = 1800;
@@ -41,6 +41,10 @@ if (!existsSync(TOKEN_FILE)) {
   throw new Error(`找不到 dinotty Agent Token: ${TOKEN_FILE}`);
 }
 const AGENT_TOKEN = (await readFile(TOKEN_FILE, "utf-8")).trim();
+if (!existsSync(PANE_FILE)) {
+  throw new Error(`找不到 cc-bridge 的 pane ID 文件: ${PANE_FILE}`);
+}
+const CC_PANE_ID = (await readFile(PANE_FILE, "utf-8")).trim();
 
 async function readCompleteLines(file) {
   if (!existsSync(file)) return [];
