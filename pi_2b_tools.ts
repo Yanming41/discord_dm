@@ -1,12 +1,60 @@
-// 2B(前台)的工具：通过 discord_bridge 的本地接口操作 Claude Code 会话。
-// 由 discord_bridge.mjs 用 `pi -p --no-extensions --no-builtin-tools -e pi_2b_tools.ts` 加载，
-// 所以 2B 只有这几个工具，不能直接读写文件或执行命令；动手的活一律交给 Claude Code 会话。
+// 2B(前台)的工具，由 discord_bridge.mjs 用 `pi -p --no-extensions --no-builtin-tools -e pi_2b_tools.ts` 加载：
+//   cc_*   通过 discord_bridge 的本地接口调度 Claude Code 会话
+//   tars_* 通过 tars-pilot(127.0.0.1:8765)在自动化浏览器里做网页操作
+// pi 自带的 read/bash/edit/write 是关掉的，要动电脑的活一律交给 Claude Code。
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
+import { spawn } from "node:child_process";
 import { Type } from "typebox";
 
 const API = process.env.DISCORD_BRIDGE_API || "http://127.0.0.1:8793";
 const TOKEN_FILE = process.env.DISCORD_BRIDGE_TOKEN_FILE || "";
+const TARS = "http://127.0.0.1:8765";
+const TARS_START_SCRIPT = "C:\\Users\\13116\\ui-tars-local\\start-all.ps1";
+const TARS_WAIT_MS = 4 * 60 * 1000; // 超过这个时间就先返回 run_id，之后用 tars_status 查
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function tars(method: string, route: string, body?: unknown) {
+  const res = await fetch(`${TARS}${route}`, {
+    method,
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error || `tars-pilot 返回 HTTP ${res.status}`);
+  return json;
+}
+
+// tars-pilot 没在跑就用它自己的启动脚本拉起来(会开一个可见的 tars-pilot 窗口)
+async function ensureTars() {
+  try {
+    await tars("GET", "/health");
+    return;
+  } catch {
+    spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", TARS_START_SCRIPT], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+  }
+  for (let i = 0; i < 30; i++) {
+    await sleep(2000);
+    try {
+      await tars("GET", "/health");
+      return;
+    } catch {}
+  }
+  throw new Error("tars-pilot 启动不起来，去电脑上看一下 tars-pilot 窗口");
+}
+
+function summarizeRun(run: any) {
+  return {
+    run_id: run.id,
+    status: run.status,
+    answer: run.result?.answer ?? null,
+    failed_step: run.result?.failedStep ?? null,
+    used_gpt: run.result?.usedGPT ?? null,
+    error: run.error ?? null,
+    recent_log: Array.isArray(run.log) ? run.log.slice(-8) : undefined,
+  };
+}
 
 async function call(method: string, route: string, body?: unknown) {
   const token = fs.readFileSync(TOKEN_FILE, "utf-8").trim();
@@ -95,5 +143,64 @@ export default function (pi: ExtensionAPI) {
     description: "结束一个会话并关掉它的终端(对话记录保留，之后还能接回来)。只在用户明确要求结束时用。",
     parameters: Type.Object({ thread_id: Type.String({ description: "会话帖子 ID" }) }),
     execute: async (_id, params) => asResult(await call("POST", "/cc/end", params)),
+  });
+
+  pi.registerTool({
+    name: "tars_recipes",
+    label: "列出网页操作模板",
+    description: "列出 tars-pilot 已保存的网页操作模板(recipe)：名字、任务描述、需要的变量。能用模板就优先用模板，比让 GPT 现规划快且稳。",
+    parameters: Type.Object({}),
+    execute: async () => {
+      await ensureTars();
+      const list = await tars("GET", "/recipes");
+      return asResult(list.map((r: any) => ({ name: r.name, task: r.task, vars: r.vars, cdp: r.cdp, browser: r.browser })));
+    },
+  });
+
+  pi.registerTool({
+    name: "tars_run",
+    label: "网页操作",
+    description:
+      "让 tars-pilot 在自动化浏览器里操作网页(看截图定位按钮、点击、输入、读页面内容)，不占用用户的真实鼠标键盘。" +
+      "二选一：recipe=模板名(配 vars) 或 task=自然语言任务描述。必须指定 cdp=要操作的标签页网址关键字。" +
+      "小红书：browser='chrome', cdp='xiaohongshu.com'；其他所有网站：browser='edge'。" +
+      "最多等 4 分钟，没做完会返回 run_id 和 status=running，之后用 tars_status 查。",
+    parameters: Type.Object({
+      task: Type.Optional(Type.String({ description: "自然语言任务，写清楚要做什么、做到哪一步算完成、要读回什么信息" })),
+      recipe: Type.Optional(Type.String({ description: "模板名，来自 tars_recipes" })),
+      vars: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "模板/任务里的变量，如 {\"keyword\":\"电动滑板车\"}" })),
+      cdp: Type.String({ description: "要操作的标签页网址关键字，如 xiaohongshu.com、bing.com" }),
+      browser: Type.Union([Type.Literal("chrome"), Type.Literal("edge")], { description: "chrome=小红书专用(9222)，edge=其他网站(9223)" }),
+      save: Type.Optional(Type.String({ description: "成功后把这次操作存成模板的名字(以后可以直接用 recipe 回放)" })),
+    }),
+    execute: async (_id, params) => {
+      if (!params.task && !params.recipe) throw new Error("task 和 recipe 至少给一个");
+      await ensureTars();
+      const started = await tars("POST", "/runs", { ...params, wait: false });
+      const runId = started.id;
+      const deadline = Date.now() + TARS_WAIT_MS;
+      while (Date.now() < deadline) {
+        await sleep(3000);
+        const run = await tars("GET", `/runs/${runId}`);
+        if (!["queued", "running"].includes(run.status)) return asResult(summarizeRun(run));
+      }
+      return asResult({ run_id: runId, status: "running", note: "还没做完，稍后用 tars_status 查结果" });
+    },
+  });
+
+  pi.registerTool({
+    name: "tars_status",
+    label: "查网页操作结果",
+    description: "查一个 tars-pilot 任务的状态和结果(answer 里是读回来的信息)。",
+    parameters: Type.Object({ run_id: Type.String({ description: "tars_run 返回的 run_id" }) }),
+    execute: async (_id, params) => asResult(summarizeRun(await tars("GET", `/runs/${params.run_id}`))),
+  });
+
+  pi.registerTool({
+    name: "tars_cancel",
+    label: "取消网页操作",
+    description: "取消一个排队中或执行中的 tars-pilot 任务。",
+    parameters: Type.Object({ run_id: Type.String({ description: "tars_run 返回的 run_id" }) }),
+    execute: async (_id, params) => asResult(await tars("POST", `/runs/${params.run_id}/cancel`, {})),
   });
 }

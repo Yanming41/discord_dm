@@ -1001,13 +1001,14 @@ async function handleMessage(ev) {
 //
 // 主频道里不是指令的消息交给 2B：每条消息调用一次 `pi -p`，用固定的 session-id 保持对话上下文。
 // 2B 不加载用户自己的 pi 扩展(frontdesk 会让 -p 模式不退出)，也没有内置的 bash/读写文件工具，
-// 只有 pi_2b_tools.ts 里那几个工具，经下面的本地接口操作 Claude Code 会话。回复由 bot 发出，bot 名字就是 2B。
+// 只有 pi_2b_tools.ts 里那几个工具：经下面的本地接口调度 Claude Code 会话，经 tars-pilot 做网页操作。
+// 回复由 bot 发出，bot 名字就是 2B。
 
 const TWOB_QUEUE = "__2b__";
 const PI_CLI = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"), "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
 const TWOB_EXTENSION = path.join(__dirname, "pi_2b_tools.ts");
 const TWOB_PROMPT = path.join(__dirname, "2b_prompt.md");
-const TWOB_TIMEOUT_MS = 5 * 60 * 1000;
+const TWOB_TIMEOUT_MS = 15 * 60 * 1000; // 网页操作冷启动模型就要一分多钟，留足时间
 state.frontdeskSessionId ??= randomUUID();
 
 function runPi(prompt) {
@@ -1027,7 +1028,7 @@ function runPi(prompt) {
     child.stderr.on("data", (d) => (err += d));
     const timer = setTimeout(() => {
       child.kill();
-      reject(new Error("2B 想了 5 分钟还没回，先放弃这一条"));
+      reject(new Error("2B 15 分钟还没回，先放弃这一条"));
     }, TWOB_TIMEOUT_MS);
     child.on("error", (e) => {
       clearTimeout(timer);
