@@ -26,7 +26,9 @@
 
 import { readFile, writeFile, rename, open, mkdir, readdir, stat } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -359,6 +361,9 @@ async function runTurn(s, ev) {
   s.busy = true;
   s.stopRequested = false;
   const started = Date.now();
+  s.turnStartedAt = started;
+  s.currentTask = ev.content.slice(0, 300);
+  s.recentTools = [];
   let progress = null;
   try {
     await react(s.threadId, ev.message_id, "👀", true);
@@ -403,6 +408,7 @@ async function runTurn(s, ev) {
           for (const c of content) {
             if (c.type === "tool_use") {
               tools.push(describeTool(c));
+              s.recentTools = tools.slice(-5);
               texts = [];
             } else if (c.type === "text" && c.text.trim()) {
               texts.push(c.text.trim());
@@ -440,7 +446,10 @@ async function runTurn(s, ev) {
       return;
     }
     await quietly(editMessage(s.threadId, progress, `✅ 完成 · 用时 ${took} · 工具调用 ${tools.length} 次`), "进度");
-    await postLong(s.threadId, texts.join("\n\n") || "(Claude 这轮没有文字回复)");
+    const reply = texts.join("\n\n") || "(Claude 这轮没有文字回复)";
+    s.lastReply = reply.slice(0, 600);
+    s.lastTurnEndedAt = Date.now();
+    await postLong(s.threadId, reply);
     await react(s.threadId, ev.message_id, "⏳", true);
     await react(s.threadId, ev.message_id, "✅");
   } catch (e) {
@@ -474,6 +483,20 @@ const THREAD_HELP = [
 ].join("\n");
 
 const HELP_TOPICS = {
+  "2b": {
+    aliases: ["前台", "frontdesk"],
+    title: "跟 2B 说话(前台)",
+    body: [
+      "在**主频道**直接说话(不用加 `/`)，就是在跟 2B 聊。2B 是你的前台，会帮你调度 Claude Code：",
+      "• 「帮我整理一下下载文件夹」→ 2B 开一个 Claude Code 会话，把任务交过去，告诉你去哪个帖子看",
+      "• 「刚才那个整理得怎么样了」→ 2B 查进度告诉你",
+      "• 「把昨天小红书那个会话接回来」→ 2B 帮你找到并接上",
+      "• 「停一下」「那个会话可以关了」→ 2B 帮你中止或结束(会先确认是哪个)",
+      "2B 自己不能直接动电脑上的文件，动手的活都交给 Claude Code。",
+      "2B 收到你的消息会显示「正在输入…」，回完你的消息上会出现 ✅。",
+      "`/2b new` 让 2B 开始一段新对话(忘掉之前聊的)。",
+    ],
+  },
   sessions: {
     aliases: ["会话", "session"],
     title: "会话：开新的、接旧的",
@@ -533,7 +556,7 @@ const HELP_TOPICS = {
     body: [
       "• 在**主频道**发 `睡眠` 或 `sleep`：电脑会回一句晚安，然后进入睡眠。",
       "• 只有你本人(DISCORD_OWNER_ID)发的消息才会被处理，别人发的指令会被忽略。",
-      "• pi agent(2B)还没接进来，接好之后会有对应的 `/2b` 指令。",
+      "• 2B 前台的用法见 `/help 2b`。",
     ],
   },
 };
@@ -542,7 +565,9 @@ function helpOverview() {
   return [
     "**📖 Discord ↔ Claude Code 操作手册**",
     "",
-    "**快速上手**",
+    "**最省事的用法**：在主频道直接跟 2B 说你要干什么，它会帮你开 Claude Code 会话、交任务、查进度。",
+    "",
+    "**自己动手**",
     "1. 主频道发 `/cc 标题` 开一个会话(或 `/sessions` + `/resume 编号` 接上以前的会话)",
     "2. 进入论坛里新出现的 `[cc] 标题` 帖子，等它说「🟢 已就绪」",
     "3. 直接在帖子里说话；表情和进度消息会告诉你 Claude 在干什么",
@@ -595,8 +620,18 @@ function sessionLimitReached() {
   return Object.keys(state.sessions).length >= MAX_SESSIONS;
 }
 
-// 新建论坛帖子 + 绑定会话 + 后台启动终端
-async function openThreadSession(threadName, intro, sessionTitle, sessionOpts, readyText) {
+// 给用户看的业务错误(会话满了、编号不对之类)，区别于程序出错
+class BridgeError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.code = code;
+  }
+}
+
+const LIMIT_MESSAGE = `最多同时 ${MAX_SESSIONS} 个会话，先在不用的帖子里发 \`/end\` 关掉一个。`;
+
+// 新建论坛帖子 + 绑定会话 + 后台启动终端；announce=false 时不在主频道发"已开会话"(2B 自己会说)
+async function openThreadSession(threadName, intro, sessionTitle, sessionOpts, readyText, { announce = true } = {}) {
   const thread = await discord("POST", `/channels/${DISCORD_FORUM_CHANNEL_ID}/threads`, {
     name: threadName.slice(0, 100),
     message: { content: `${intro}\n\n${THREAD_HELP}` },
@@ -605,7 +640,7 @@ async function openThreadSession(threadName, intro, sessionTitle, sessionOpts, r
   const s = newSession(thread.id, sessionTitle, sessionOpts);
   state.sessions[thread.id] = s;
   await saveState();
-  await postMessage(DISCORD_CHANNEL_ID, `已开会话 <#${thread.id}>`, toMain);
+  if (announce) await postMessage(DISCORD_CHANNEL_ID, `已开会话 <#${thread.id}>`, toMain);
   enqueue(thread.id, async () => {
     try {
       await ensurePane(s);
@@ -615,14 +650,30 @@ async function openThreadSession(threadName, intro, sessionTitle, sessionOpts, r
       await postMessage(thread.id, `❌ 终端启动失败：${e.message}`);
     }
   });
+  return s;
+}
+
+async function openNewCcSession(title, { cwd = DEFAULT_CWD, announce = true } = {}) {
+  if (sessionLimitReached()) throw new BridgeError(LIMIT_MESSAGE, "limit");
+  if (!existsSync(cwd)) throw new BridgeError(`目录不存在：${cwd}`, "bad_cwd");
+  return openThreadSession(`[cc] ${title}`, "Claude Code 新会话。终端启动中，好了会在这里说一声。", title, { cwd }, "🟢 Claude Code 已就绪，直接发消息吧。", { announce });
 }
 
 async function createSession(title) {
-  if (sessionLimitReached()) {
-    await postMessage(DISCORD_CHANNEL_ID, `最多同时 ${MAX_SESSIONS} 个会话，先在不用的帖子里发 \`/end\` 关掉一个。`, toMain);
-    return;
+  try {
+    await openNewCcSession(title);
+  } catch (e) {
+    if (!(e instanceof BridgeError)) throw e;
+    await postMessage(DISCORD_CHANNEL_ID, e.message, toMain);
   }
-  await openThreadSession(`[cc] ${title}`, "Claude Code 新会话。终端启动中，好了会在这里说一声。", title, {}, "🟢 Claude Code 已就绪，直接发消息吧。");
+}
+
+// 把一条消息作为任务交给某个会话：先以 2B 的身份在帖子里贴出来，再排队发给 Claude
+async function deliverToSession(s, text, from = "2B") {
+  const preview = `📝 **${from} 转交的任务**\n${text}`;
+  const m = await postMessage(s.threadId, preview.length > 1990 ? `${preview.slice(0, 1980)}…` : preview, toMain);
+  await react(s.threadId, m.id, "👀");
+  enqueue(s.threadId, () => runTurn(s, { message_id: m.id, content: text }));
 }
 
 // ---------- 本机的 Claude 会话列表 / 恢复 ----------
@@ -735,43 +786,44 @@ async function showClaudeSessions() {
   await postLong(DISCORD_CHANNEL_ID, rows.join("\n"), toMain);
 }
 
+// item: { sessionId, file, cwd, title }
+async function resumeItem(item, force, { announce = true } = {}) {
+  const bound = boundSessionFor(item.sessionId);
+  if (bound) throw new BridgeError(`这个会话已经绑定在 <#${bound.threadId}> 了，直接去那里聊。`, "already_bound");
+  if (sessionLimitReached()) throw new BridgeError(LIMIT_MESSAGE, "limit");
+  const st = await stat(item.file).catch(() => null);
+  if (!st) throw new BridgeError("这个会话的记录文件找不到了。", "missing");
+  const idleMs = Date.now() - st.mtimeMs;
+  if (!force && idleMs < RECENTLY_ACTIVE_MS) {
+    throw new BridgeError(
+      `「${item.title ?? item.sessionId.slice(0, 8)}」${formatAgo(idleMs)}还在更新，可能正开在别的终端里，两边同时用会把记录写乱。`,
+      "recently_active"
+    );
+  }
+  const title = item.title ?? `会话 ${item.sessionId.slice(0, 8)}`;
+  return openThreadSession(
+    `[cc] ${title}`,
+    `接上之前的 Claude Code 会话「${title}」（目录 \`${item.cwd}\`）。终端启动中，好了会在这里说一声。`,
+    title,
+    { claudeSessionId: item.sessionId, cwd: item.cwd, transcriptFile: item.file },
+    `🟢 已接上「${title}」，之前的上下文都在，直接发消息继续聊。`,
+    { announce }
+  );
+}
+
 async function resumeClaudeSession(n, force) {
   const item = state.lastListing[n - 1];
   if (!item) {
     await postMessage(DISCORD_CHANNEL_ID, "编号不对，先发 `/sessions` 看列表。", toMain);
     return;
   }
-  const bound = boundSessionFor(item.sessionId);
-  if (bound) {
-    await postMessage(DISCORD_CHANNEL_ID, `这个会话已经绑定在 <#${bound.threadId}> 了，直接去那里聊。`, toMain);
-    return;
+  try {
+    await resumeItem(item, force);
+  } catch (e) {
+    if (!(e instanceof BridgeError)) throw e;
+    const hint = e.code === "recently_active" ? `确认要接请发 \`/resume ${n}!\`` : e.code === "missing" ? "重新 `/sessions` 看看。" : "";
+    await postMessage(DISCORD_CHANNEL_ID, `${e.message}${hint}`, toMain);
   }
-  if (sessionLimitReached()) {
-    await postMessage(DISCORD_CHANNEL_ID, `最多同时 ${MAX_SESSIONS} 个会话，先在不用的帖子里发 \`/end\` 关掉一个。`, toMain);
-    return;
-  }
-  const st = await stat(item.file).catch(() => null);
-  if (!st) {
-    await postMessage(DISCORD_CHANNEL_ID, "这个会话的记录文件找不到了，重新 `/sessions` 看看。", toMain);
-    return;
-  }
-  const idleMs = Date.now() - st.mtimeMs;
-  if (!force && idleMs < RECENTLY_ACTIVE_MS) {
-    await postMessage(
-      DISCORD_CHANNEL_ID,
-      `「${item.title ?? item.sessionId.slice(0, 8)}」${formatAgo(idleMs)}还在更新，可能正开在别的终端里。两边同时用会把记录写乱，确认要接请发 \`/resume ${n}!\``,
-      toMain
-    );
-    return;
-  }
-  const title = item.title ?? `会话 ${item.sessionId.slice(0, 8)}`;
-  await openThreadSession(
-    `[cc] ${title}`,
-    `接上之前的 Claude Code 会话「${title}」（目录 \`${item.cwd}\`）。终端启动中，好了会在这里说一声。`,
-    title,
-    { claudeSessionId: item.sessionId, cwd: item.cwd, transcriptFile: item.file },
-    `🟢 已接上「${title}」，之前的上下文都在，直接发消息继续聊。`
-  );
 }
 
 // ---------- 帖子里的 Claude Code 指令 ----------
@@ -938,6 +990,193 @@ async function handleMessage(ev) {
   if (text === "/list") return listSessions();
   const help = text.match(/^\/help(?:\s+(.*))?$/s);
   if (help) return showHelp(DISCORD_CHANNEL_ID, help[1] ?? "", toMain);
+  if (text === "/2b new") return reset2b();
+  if (!text || text.startsWith("/")) return;
+  // 其余的话都交给前台 2B
+  await react(DISCORD_CHANNEL_ID, ev.message_id, "👀");
+  enqueue(TWOB_QUEUE, () => run2bTurn(ev));
+}
+
+// ---------- 2B 前台(pi agent) ----------
+//
+// 主频道里不是指令的消息交给 2B：每条消息调用一次 `pi -p`，用固定的 session-id 保持对话上下文。
+// 2B 不加载用户自己的 pi 扩展(frontdesk 会让 -p 模式不退出)，也没有内置的 bash/读写文件工具，
+// 只有 pi_2b_tools.ts 里那几个工具，经下面的本地接口操作 Claude Code 会话。回复由 bot 发出，bot 名字就是 2B。
+
+const TWOB_QUEUE = "__2b__";
+const PI_CLI = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"), "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+const TWOB_EXTENSION = path.join(__dirname, "pi_2b_tools.ts");
+const TWOB_PROMPT = path.join(__dirname, "2b_prompt.md");
+const TWOB_TIMEOUT_MS = 5 * 60 * 1000;
+state.frontdeskSessionId ??= randomUUID();
+
+function runPi(prompt) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [PI_CLI, "-p", "--session-id", state.frontdeskSessionId, "--no-extensions", "--no-builtin-tools", "--no-context-files", "-e", TWOB_EXTENSION, "--append-system-prompt", TWOB_PROMPT],
+      {
+        cwd: HOME,
+        windowsHide: true,
+        env: { ...process.env, DISCORD_BRIDGE_API: `http://127.0.0.1:${API_PORT}`, DISCORD_BRIDGE_TOKEN_FILE: API_TOKEN_FILE },
+      }
+    );
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("2B 想了 5 分钟还没回，先放弃这一条"));
+    }, TWOB_TIMEOUT_MS);
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0 && out.trim()) resolve(out.trim());
+      else reject(new Error(stripAnsi(err || out).trim().slice(-400) || `pi 退出码 ${code}`));
+    });
+    child.stdin.end(prompt);
+  });
+}
+
+async function run2bTurn(ev) {
+  const ch = DISCORD_CHANNEL_ID;
+  const typing = () => quietly(discord("POST", `/channels/${ch}/typing`), "typing");
+  await typing();
+  const timer = setInterval(typing, 8000); // "2B 正在输入…" 每次只持续约 10 秒，要不停续
+  try {
+    const reply = await runPi(ev.content);
+    await postLong(ch, reply, toMain);
+    await react(ch, ev.message_id, "👀", true);
+    await react(ch, ev.message_id, "✅");
+  } catch (e) {
+    console.error("[2B]", e.message);
+    await postMessage(ch, `❌ 2B 出错了：${e.message}`, toMain);
+    await react(ch, ev.message_id, "👀", true);
+    await react(ch, ev.message_id, "❌");
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+async function reset2b() {
+  state.frontdeskSessionId = randomUUID();
+  await saveState();
+  await postMessage(DISCORD_CHANNEL_ID, "好，2B 这边开始一段新对话了（之前聊的不再记得）。", toMain);
+}
+
+// ---------- 给 2B 用的本地接口(只监听 127.0.0.1，带密钥) ----------
+
+const API_PORT = 8793;
+const API_TOKEN_FILE = path.join(DATA_DIR, "bridge_api_token");
+if (!existsSync(API_TOKEN_FILE)) await writeFile(API_TOKEN_FILE, randomBytes(24).toString("hex"), "utf-8");
+const API_TOKEN = (await readFile(API_TOKEN_FILE, "utf-8")).trim();
+
+function sessionSummary(s) {
+  return {
+    thread_id: s.threadId,
+    link: `<#${s.threadId}>`,
+    title: s.title,
+    cwd: s.cwd,
+    busy: Boolean(s.busy),
+    current_task: s.busy ? s.currentTask ?? null : null,
+    running_for: s.busy && s.turnStartedAt ? formatElapsed(Date.now() - s.turnStartedAt) : null,
+    recent_actions: s.busy ? s.recentTools ?? [] : [],
+    last_reply: s.lastReply ?? null,
+    last_finished: s.lastTurnEndedAt ? formatAgo(Date.now() - s.lastTurnEndedAt) : null,
+  };
+}
+
+function requireSession(threadId) {
+  const s = state.sessions[threadId];
+  if (!s) throw new BridgeError(`没有这个会话：${threadId}。先用 cc_status 看看现有的会话。`, "no_session");
+  return s;
+}
+
+const apiRoutes = {
+  "GET /sessions": async (q) => ({
+    sessions: Object.values(state.sessions)
+      .filter((s) => !q.thread_id || s.threadId === q.thread_id)
+      .map(sessionSummary),
+    max_sessions: MAX_SESSIONS,
+  }),
+  "GET /history": async (q) => {
+    const list = await listClaudeSessions(Math.min(Number(q.limit) || 10, 30));
+    return {
+      sessions: list.map((d) => {
+        const bound = boundSessionFor(d.sessionId);
+        return {
+          session_id: d.sessionId,
+          title: d.title,
+          last_prompt: (d.lastPrompt ?? "").slice(0, 120),
+          cwd: d.cwd,
+          updated: formatAgo(Date.now() - d.mtimeMs),
+          recently_active: !bound && Date.now() - d.mtimeMs < RECENTLY_ACTIVE_MS,
+          bound_thread: bound ? `<#${bound.threadId}>` : null,
+        };
+      }),
+    };
+  },
+  "POST /cc/open": async (_q, b) => {
+    if (!b.title) throw new BridgeError("缺少 title");
+    const s = await openNewCcSession(String(b.title).slice(0, 90), { cwd: b.cwd || DEFAULT_CWD, announce: false });
+    if (b.task) await deliverToSession(s, String(b.task));
+    return { thread_id: s.threadId, link: `<#${s.threadId}>`, task_delivered: Boolean(b.task) };
+  },
+  "POST /cc/send": async (_q, b) => {
+    const s = requireSession(b.thread_id);
+    if (!b.text) throw new BridgeError("缺少 text");
+    const wasBusy = Boolean(s.busy);
+    await deliverToSession(s, String(b.text));
+    return { ok: true, link: `<#${s.threadId}>`, queued_behind_running_task: wasBusy };
+  },
+  "POST /cc/resume": async (_q, b) => {
+    const item = (await listClaudeSessions(50)).find((d) => d.sessionId === b.session_id);
+    if (!item) throw new BridgeError("找不到这个 session_id，先用 cc_list_history 看看。", "missing");
+    const s = await resumeItem(item, Boolean(b.force), { announce: false });
+    return { thread_id: s.threadId, link: `<#${s.threadId}>` };
+  },
+  "POST /cc/stop": async (_q, b) => {
+    const s = requireSession(b.thread_id);
+    if (!s.busy || !s.paneId) return { stopped: false, reason: "这个会话现在没有在跑的任务" };
+    await stopSession(s);
+    return { stopped: true };
+  },
+  "POST /cc/end": async (_q, b) => {
+    const s = requireSession(b.thread_id);
+    enqueue(s.threadId, () => guarded(s, "结束会话", () => endSession(s)));
+    return { ending: true, note: s.busy ? "当前任务做完后再结束" : "马上结束" };
+  },
+};
+
+function startApiServer() {
+  const server = createServer(async (req, res) => {
+    const send = (code, obj) => {
+      res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(obj));
+    };
+    try {
+      if (req.headers.authorization !== `Bearer ${API_TOKEN}`) return send(401, { error: "unauthorized" });
+      const url = new URL(req.url, "http://127.0.0.1");
+      const handler = apiRoutes[`${req.method} ${url.pathname}`];
+      if (!handler) return send(404, { error: "没有这个接口" });
+      let body = {};
+      if (req.method === "POST") {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        if (chunks.length) body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      }
+      send(200, await handler(Object.fromEntries(url.searchParams), body));
+    } catch (e) {
+      if (!(e instanceof BridgeError)) console.error("[api]", e.message);
+      send(e instanceof BridgeError ? 400 : 500, { error: e.message, code: e.code });
+    }
+  });
+  server.on("error", (e) => console.error("[api] 本地接口启动失败(2B 的工具会用不了):", e.message));
+  server.listen(API_PORT, "127.0.0.1", () => console.log(`[api] 2B 工具接口在 127.0.0.1:${API_PORT}`));
 }
 
 async function handleThreadCommand(s, ev, text) {
@@ -1003,5 +1242,7 @@ for (;;) {
     await sleep(10000);
   }
 }
+await saveState();
+startApiServer();
 console.log(`[discord_bridge] 启动，会话 ${Object.keys(state.sessions).length} 个，inbox 从第 ${state.inboxLines} 行开始`);
 setInterval(() => tick().catch((e) => console.error("[tick]", e.message)), POLL_MS);
