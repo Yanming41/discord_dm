@@ -496,7 +496,8 @@ const HELP_TOPICS = {
       "轻量小事(看个文件、跑条命令)2B 自己做；大活交给 Claude Code。删除、发消息、提交代码这类操作它会先问你。",
       "2B 会按你这句话属于哪个领域(学习/开发/生活…)切换说话方式，配置来自 frontdesk。",
       "2B 收到你的消息会显示「正在输入…」，回完你的消息上会出现 ✅。",
-      "`/2b new` 让 2B 开始一段新对话(忘掉之前聊的)。",
+      "2B 在主频道的聊天是一段连续的对话，跨天也接着。她还有一个长期记忆文件，会自己记下你的偏好和交代的事；跟她说「记住…」「忘掉…」就行。",
+      "`/2b new` 让 2B 开始一段新对话(忘掉聊天内容，但长期记忆文件里记下的还在)。",
     ],
   },
   sessions: {
@@ -1011,6 +1012,15 @@ const PI_CLI = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roam
 const TWOB_EXTENSION = path.join(__dirname, "pi_2b_tools.ts");
 const TWOB_PROMPT = path.join(__dirname, "2b_prompt.md");
 const TWOB_PROFILES = path.join(__dirname, "2b_profiles.md"); // 抽自 frontdesk.ts 的 PROMPT_PROFILES，按领域切换说话方式和规矩
+// 2B 的长期记忆：每次回复前作为系统提示词读进去，她用自己的编辑工具维护。是用户的个人数据，所以放仓库外。
+const TWOB_MEMORY = path.join(DATA_DIR, "2b_memory.md");
+if (!existsSync(TWOB_MEMORY)) {
+  await writeFile(
+    TWOB_MEMORY,
+    "# 2B 的记忆\n\n(这是 2B 自己维护的长期记忆，每次回复前都会读到。)\n\n## zym 的偏好\n\n## 长期交代的事\n\n## 正在跟进的事\n\n## 其他要记住的\n",
+    "utf-8"
+  );
+}
 const TWOB_TIMEOUT_MS = 15 * 60 * 1000; // 网页操作冷启动模型就要一分多钟，留足时间
 state.frontdeskSessionId ??= randomUUID();
 
@@ -1021,6 +1031,7 @@ function runPi(prompt) {
       [
         PI_CLI, "-p", "--session-id", state.frontdeskSessionId, "--no-extensions", "--no-context-files",
         "-e", TWOB_EXTENSION, "--append-system-prompt", TWOB_PROMPT, "--append-system-prompt", TWOB_PROFILES,
+        "--append-system-prompt", TWOB_MEMORY,
       ],
       {
         cwd: HOME,
@@ -1072,7 +1083,7 @@ async function run2bTurn(ev) {
 async function reset2b() {
   state.frontdeskSessionId = randomUUID();
   await saveState();
-  await postMessage(DISCORD_CHANNEL_ID, "好，2B 这边开始一段新对话了（之前聊的不再记得）。", toMain);
+  await postMessage(DISCORD_CHANNEL_ID, "好，2B 这边开始一段新对话了（之前的聊天内容不再记得，长期记忆文件里记下的还在）。", toMain);
 }
 
 // ---------- 给 2B 用的本地接口(只监听 127.0.0.1，带密钥) ----------
