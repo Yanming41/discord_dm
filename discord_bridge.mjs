@@ -492,7 +492,9 @@ const HELP_TOPICS = {
       "• 「刚才那个整理得怎么样了」→ 2B 查进度告诉你",
       "• 「把昨天小红书那个会话接回来」→ 2B 帮你找到并接上",
       "• 「停一下」「那个会话可以关了」→ 2B 帮你中止或结束(会先确认是哪个)",
-      "2B 自己不能直接动电脑上的文件，动手的活都交给 Claude Code。",
+      "• 「帮我在小红书搜一下 xxx」→ 2B 用 tars-pilot 在自动化浏览器里操作，不占用你的鼠标",
+      "轻量小事(看个文件、跑条命令)2B 自己做；大活交给 Claude Code。删除、发消息、提交代码这类操作它会先问你。",
+      "2B 会按你这句话属于哪个领域(学习/开发/生活…)切换说话方式，配置来自 frontdesk。",
       "2B 收到你的消息会显示「正在输入…」，回完你的消息上会出现 ✅。",
       "`/2b new` 让 2B 开始一段新对话(忘掉之前聊的)。",
     ],
@@ -1000,14 +1002,15 @@ async function handleMessage(ev) {
 // ---------- 2B 前台(pi agent) ----------
 //
 // 主频道里不是指令的消息交给 2B：每条消息调用一次 `pi -p`，用固定的 session-id 保持对话上下文。
-// 2B 不加载用户自己的 pi 扩展(frontdesk 会让 -p 模式不退出)，也没有内置的 bash/读写文件工具，
-// 只有 pi_2b_tools.ts 里那几个工具：经下面的本地接口调度 Claude Code 会话，经 tars-pilot 做网页操作。
-// 回复由 bot 发出，bot 名字就是 2B。
+// 2B 不加载用户自己的 pi 扩展(frontdesk 会让 -p 模式不退出)，只把 frontdesk 的领域提示词配置抽成 2b_profiles.md 带上。
+// 工具：pi 自带的 read/bash/edit/write(轻量小活自己做)，加上 pi_2b_tools.ts 里经下面的本地接口调度 Claude Code、
+// 经 tars-pilot 做网页操作的工具。回复由 bot 发出，bot 名字就是 2B。
 
 const TWOB_QUEUE = "__2b__";
 const PI_CLI = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"), "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
 const TWOB_EXTENSION = path.join(__dirname, "pi_2b_tools.ts");
 const TWOB_PROMPT = path.join(__dirname, "2b_prompt.md");
+const TWOB_PROFILES = path.join(__dirname, "2b_profiles.md"); // 抽自 frontdesk.ts 的 PROMPT_PROFILES，按领域切换说话方式和规矩
 const TWOB_TIMEOUT_MS = 15 * 60 * 1000; // 网页操作冷启动模型就要一分多钟，留足时间
 state.frontdeskSessionId ??= randomUUID();
 
@@ -1015,7 +1018,10 @@ function runPi(prompt) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      [PI_CLI, "-p", "--session-id", state.frontdeskSessionId, "--no-extensions", "--no-builtin-tools", "--no-context-files", "-e", TWOB_EXTENSION, "--append-system-prompt", TWOB_PROMPT],
+      [
+        PI_CLI, "-p", "--session-id", state.frontdeskSessionId, "--no-extensions", "--no-context-files",
+        "-e", TWOB_EXTENSION, "--append-system-prompt", TWOB_PROMPT, "--append-system-prompt", TWOB_PROFILES,
+      ],
       {
         cwd: HOME,
         windowsHide: true,

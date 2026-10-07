@@ -1,7 +1,7 @@
-// 2B(前台)的工具，由 discord_bridge.mjs 用 `pi -p --no-extensions --no-builtin-tools -e pi_2b_tools.ts` 加载：
+// 2B(前台)的额外工具，由 discord_bridge.mjs 用 `pi -p --no-extensions -e pi_2b_tools.ts` 加载：
 //   cc_*   通过 discord_bridge 的本地接口调度 Claude Code 会话
 //   tars_* 通过 tars-pilot(127.0.0.1:8765)在自动化浏览器里做网页操作
-// pi 自带的 read/bash/edit/write 是关掉的，要动电脑的活一律交给 Claude Code。
+// pi 自带的 read/bash/edit/write 也开着，轻量的小活 2B 自己做。
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import { spawn } from "node:child_process";
