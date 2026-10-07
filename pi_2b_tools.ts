@@ -89,7 +89,7 @@ export default function (pi: ExtensionAPI) {
       "开一个新的 Claude Code 会话(论坛里新建一个帖子，电脑上开一个终端)。如果给了 task，会把任务作为第一条消息交给它，进度和结果会出现在那个帖子里。返回帖子链接。",
     parameters: Type.Object({
       title: Type.String({ description: "会话标题，简短概括要做的事" }),
-      task: Type.Optional(Type.String({ description: "要交给 Claude Code 的完整任务描述，写清楚目标和要求" })),
+      task: Type.Optional(Type.String({ description: "要转给 Claude Code 的任务，基本照用户原话；缺上下文时补一两句事实背景，不要加你自己的流程或要求" })),
       cwd: Type.Optional(Type.String({ description: "工作目录，默认用户主目录 C:\\Users\\13116" })),
     }),
     execute: async (_id, params) => asResult(await call("POST", "/cc/open", params)),
@@ -101,7 +101,7 @@ export default function (pi: ExtensionAPI) {
     description: "往一个已经存在的 Claude Code 会话帖子里发一条消息(交代新任务、补充要求、回答它的问题)。Claude 正在忙的话会排队。",
     parameters: Type.Object({
       thread_id: Type.String({ description: "会话帖子 ID，从 cc_status 或 cc_open 的结果里拿" }),
-      text: Type.String({ description: "要发给 Claude 的内容" }),
+      text: Type.String({ description: "要发给 Claude 的内容，基本照用户原话" }),
     }),
     execute: async (_id, params) => asResult(await call("POST", "/cc/send", params)),
   });
