@@ -1157,6 +1157,12 @@ const apiRoutes = {
     const s = await resumeItem(item, Boolean(b.force), { announce: false });
     return { thread_id: s.threadId, link: `<#${s.threadId}>` };
   },
+  // 网页操作过程中需要用户马上看到的事(比如 Duo 匹配码)，不等 2B 这一轮回复完就先发到主频道
+  "POST /notify": async (_q, b) => {
+    if (!b.text) throw new BridgeError("缺少 text");
+    await postMessage(DISCORD_CHANNEL_ID, String(b.text).slice(0, 1900), toMain);
+    return { ok: true };
+  },
   "POST /cc/stop": async (_q, b) => {
     const s = requireSession(b.thread_id);
     if (!s.busy || !s.paneId) return { stopped: false, reason: "这个会话现在没有在跑的任务" };

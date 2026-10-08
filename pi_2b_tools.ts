@@ -13,7 +13,33 @@ const TARS = "http://127.0.0.1:8765";
 const TARS_START_SCRIPT = "C:\\Users\\13116\\ui-tars-local\\start-all.ps1";
 const TARS_WAIT_MS = 4 * 60 * 1000; // 超过这个时间就先返回 run_id，之后用 tars_status 查
 
+const BROWSER_PORTS: Record<string, number> = { chrome: 9222, edge: 9223 };
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// tars-pilot 只操作已经打开的、网址里带 cdp 关键字的标签页，自己不会新开标签页。
+// 没有匹配的就先开一个；cdp 不能是 newtab/about:blank 这种占位值。
+async function ensureTab(browser: string, cdp: string, url?: string) {
+  const port = BROWSER_PORTS[browser];
+  if (!port) return;
+  const tabs = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+  if (tabs.some((t: any) => t.type === "page" && String(t.url).includes(cdp))) return;
+  const target = url || (cdp.includes(".") ? `https://${cdp}` : "");
+  if (!target) throw new Error(`没有网址包含「${cdp}」的标签页，需要给 url 或者用网站域名做 cdp`);
+  await fetch(`http://127.0.0.1:${port}/json/new?${encodeURI(target)}`, { method: "PUT" });
+  await sleep(4000);
+}
+
+// 把 Duo 匹配码这类通知实时发到 Discord(tars-pilot 默认只弹 Windows 通知，用户在外面看不到)
+async function forwardNotices(run: any, sent: Set<string>) {
+  for (const line of Array.isArray(run.log) ? run.log : []) {
+    const text = typeof line === "string" ? line : JSON.stringify(line);
+    const m = text.match(/\[通知\]\s*(.+)/);
+    if (!m || sent.has(m[1])) continue;
+    sent.add(m[1]);
+    await call("POST", "/notify", { text: `🔔 网页操作需要你：${m[1]}` }).catch(() => {});
+  }
+}
 
 async function tars(method: string, route: string, body?: unknown) {
   const res = await fetch(`${TARS}${route}`, {
@@ -169,19 +195,24 @@ export default function (pi: ExtensionAPI) {
       task: Type.Optional(Type.String({ description: "自然语言任务，写清楚要做什么、做到哪一步算完成、要读回什么信息" })),
       recipe: Type.Optional(Type.String({ description: "模板名，来自 tars_recipes" })),
       vars: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "模板/任务里的变量，如 {\"keyword\":\"电动滑板车\"}" })),
-      cdp: Type.String({ description: "要操作的标签页网址关键字，如 xiaohongshu.com、bing.com" }),
+      cdp: Type.String({ description: "要操作的标签页网址关键字，填网站域名，如 xiaohongshu.com、bing.com、q.utoronto.ca；没有这样的标签页会自动打开一个" }),
+      url: Type.Optional(Type.String({ description: "要打开的具体网址；不填就打开 https://<cdp>" })),
       browser: Type.Union([Type.Literal("chrome"), Type.Literal("edge")], { description: "chrome=小红书专用(9222)，edge=其他网站(9223)" }),
       save: Type.Optional(Type.String({ description: "成功后把这次操作存成模板的名字(以后可以直接用 recipe 回放)" })),
     }),
     execute: async (_id, params) => {
       if (!params.task && !params.recipe) throw new Error("task 和 recipe 至少给一个");
       await ensureTars();
-      const started = await tars("POST", "/runs", { ...params, wait: false });
+      const { url, ...req } = params;
+      await ensureTab(req.browser, req.cdp, url);
+      const started = await tars("POST", "/runs", { ...req, wait: false });
       const runId = started.id;
       const deadline = Date.now() + TARS_WAIT_MS;
+      const sent = new Set<string>();
       while (Date.now() < deadline) {
         await sleep(3000);
         const run = await tars("GET", `/runs/${runId}`);
+        await forwardNotices(run, sent);
         if (!["queued", "running"].includes(run.status)) return asResult(summarizeRun(run));
       }
       return asResult({ run_id: runId, status: "running", note: "还没做完，稍后用 tars_status 查结果" });
