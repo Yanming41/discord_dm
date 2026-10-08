@@ -99,12 +99,15 @@ async function loadState() {
 const projectDirFor = (cwd) => path.join(PROJECTS_DIR, cwd.replace(/[^a-zA-Z0-9]/g, "-"));
 
 function newSession(threadId, title, { claudeSessionId = randomUUID(), cwd = DEFAULT_CWD, transcriptFile = null } = {}) {
+  const file = transcriptFile ?? path.join(projectDirFor(cwd), `${claudeSessionId}.jsonl`);
   return {
     threadId,
     title,
     claudeSessionId,
     cwd,
-    transcriptFile: transcriptFile ?? path.join(projectDirFor(cwd), `${claudeSessionId}.jsonl`),
+    transcriptFile: file,
+    sweepFrom: existsSync(file) ? statSync(file).size : 0, // 接旧会话时从当前位置开始补发，不重发历史
+    postedTurns: [],
     tabId: null,
     paneId: null,
     paneToken: null,
@@ -117,8 +120,11 @@ const state = await loadState();
 state.lastListing ??= [];
 for (const s of Object.values(state.sessions)) {
   s.busy = false;
+  s.sweepPending = false;
   s.cwd ??= DEFAULT_CWD;
   s.transcriptFile ??= path.join(projectDirFor(s.cwd), `${s.claudeSessionId}.jsonl`);
+  s.sweepFrom ??= existsSync(s.transcriptFile) ? statSync(s.transcriptFile).size : 0;
+  s.postedTurns ??= [];
 }
 const saveState = () => writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
 await saveState(); // 旧状态迁移完立刻落盘，免得还没收到消息就重启导致迁移结果丢失
@@ -390,6 +396,32 @@ async function readEntriesFrom(file, offset) {
   }
 }
 
+// 和 readEntriesFrom 一样，但每条记录带上它结束处的字节位置(补发时用来推进扫描位置)
+async function readEntriesWithEnds(file, offset) {
+  if (!existsSync(file)) return [];
+  const fh = await open(file, "r");
+  try {
+    const { size } = await fh.stat();
+    if (size <= offset) return [];
+    const buf = Buffer.alloc(size - offset);
+    await fh.read(buf, 0, buf.length, offset);
+    const out = [];
+    let pos = 0;
+    for (;;) {
+      const nl = buf.indexOf(0x0a, pos);
+      if (nl === -1) break; // 最后半行还没写完
+      const line = buf.subarray(pos, nl).toString("utf8");
+      pos = nl + 1;
+      try {
+        if (line.trim()) out.push({ e: JSON.parse(line), end: offset + pos });
+      } catch {}
+    }
+    return out;
+  } finally {
+    await fh.close();
+  }
+}
+
 function describeTool(c) {
   const i = c.input || {};
   let arg = i.file_path ? path.basename(String(i.file_path)) : i.command || i.pattern || i.url || i.query || i.description || i.path || "";
@@ -428,6 +460,7 @@ async function runTurn(s, ev) {
     let resubmitted = false;
 
     let phase = "sending"; // sending → (queued →) active，见下面的循环
+    let turnEndUuid = null; // 这一轮结束标记的 ID，发完回复后登记，补发时据此跳过
     let done = false;
     let interrupted = false;
     let permissionWarned = false;
@@ -476,7 +509,10 @@ async function runTurn(s, ev) {
             }
           }
         }
-        if (e.type === "system" && e.subtype === "turn_duration") done = true;
+        if (e.type === "system" && e.subtype === "turn_duration") {
+          done = true;
+          turnEndUuid = e.uuid;
+        }
       }
       if (done) break;
       // 按了 /stop 但记录里没写中断标记(比如还在思考阶段)，等几秒就不等了
@@ -523,6 +559,7 @@ async function runTurn(s, ev) {
     s.lastReply = reply.slice(0, 600);
     s.lastTurnEndedAt = Date.now();
     await postLong(s.threadId, reply);
+    markTurnPosted(s, turnEndUuid);
     await react(s.threadId, ev.message_id, "⏳", true);
     await react(s.threadId, ev.message_id, "✅");
   } catch (e) {
@@ -537,6 +574,83 @@ async function runTurn(s, ev) {
     await setThreadStatus(s.threadId, TAG_IDLE);
   }
 }
+
+// ---------- 补发：桥接没跟上的轮次，做完后把回复补发到帖子里 ----------
+//
+// 正常由 runTurn 跟踪的轮次发完就登记(markTurnPosted)。下面这些情况没人跟：Claude 额度恢复后自己接着干、
+// 用户在终端里直接问、桥接重启或报错放弃了正在进行的那一轮。后台定期扫每个会话的记录，
+// 已经结束(有 turn_duration)但没登记过的轮次就补发。扫描位置 sweepFrom 只往前走，不会把历史重发。
+
+const SWEEP_MS = 15000;
+
+function markTurnPosted(s, uuid) {
+  if (uuid) s.postedTurns = [...(s.postedTurns ?? []), uuid].slice(-100);
+}
+
+function describeTrigger(prompt) {
+  if (!prompt) return "Claude 在桥接没跟着的时候做完了一轮，这是它的回复";
+  if (/usage limit has reset/i.test(prompt)) return "Claude 额度恢复后自己接着做完了之前的活，这是它的回复";
+  const p = prompt.replace(/\s+/g, " ").trim();
+  return `「${p.length > 60 ? `${p.slice(0, 60)}…` : p}」这一轮桥接当时没跟上(可能中途报错了，或者是在终端里直接问的)，这是 Claude 的回复`;
+}
+
+async function sweepSession(s) {
+  const file = transcriptPath(s);
+  if (!file || !existsSync(file)) return;
+  const items = await readEntriesWithEnds(file, s.sweepFrom ?? 0);
+  let texts = [];
+  let tools = 0;
+  let trigger = null;
+  for (const { e, end } of items) {
+    if (e.isSidechain) continue;
+    const content = e.message?.content;
+    if (trigger === null && !e.isMeta) {
+      if (e.type === "user" && typeof content === "string" && !content.startsWith("<")) trigger = content;
+      else if (e.type === "queue-operation" && e.operation === "enqueue" && e.content) trigger = e.content;
+    }
+    if (e.type === "assistant" && Array.isArray(content)) {
+      for (const c of content) {
+        if (c.type === "tool_use") {
+          tools++;
+          texts = [];
+        } else if (c.type === "text" && c.text.trim()) {
+          texts.push(c.text.trim());
+        }
+      }
+    }
+    if (e.type === "system" && e.subtype === "turn_duration") {
+      if (!(s.postedTurns ?? []).includes(e.uuid) && (texts.length || tools)) {
+        const reply = texts.join("\n\n") || "(这一轮没有文字回复)";
+        await postLong(s.threadId, `📬 **补发**：${describeTrigger(trigger)}\n\n${reply}`);
+        s.lastReply = reply.slice(0, 600);
+        s.lastTurnEndedAt = Date.now();
+        markTurnPosted(s, e.uuid);
+      }
+      s.sweepFrom = end;
+      texts = [];
+      tools = 0;
+      trigger = null;
+      await saveState();
+    }
+  }
+}
+
+// 补发和正常对话走同一个帖子队列，不会和 runTurn 抢着发
+setInterval(() => {
+  for (const s of Object.values(state.sessions)) {
+    if (s.sweepPending || s.busy) continue;
+    s.sweepPending = true;
+    enqueue(s.threadId, async () => {
+      try {
+        await sweepSession(s);
+      } catch (e) {
+        console.error(`[补发 ${s.threadId}]`, e.message);
+      } finally {
+        s.sweepPending = false;
+      }
+    });
+  }
+}, SWEEP_MS);
 
 // ---------- 命令 ----------
 
@@ -1001,6 +1115,8 @@ async function clearSession(s) {
   const fresh = newSession(s.threadId, s.title, { cwd: s.cwd });
   s.claudeSessionId = fresh.claudeSessionId;
   s.transcriptFile = fresh.transcriptFile;
+  s.sweepFrom = 0;
+  s.postedTurns = [];
   await saveState();
   await ensurePane(s);
   await saveState();
