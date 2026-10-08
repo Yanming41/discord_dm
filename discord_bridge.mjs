@@ -337,11 +337,19 @@ async function ensurePane(s) {
   throw new Error("Claude Code 终端 90 秒内没有进入输入状态，可以发 /screen 看看卡在哪个界面，或者去 dinotty 处理");
 }
 
+// 回车必须单独发：长文字一次性写进终端会被 Claude Code 当成"粘贴"，粘贴里的回车只算换行、不提交，
+// 文字就卡在输入框里(下一条消息还会拼接上去)。所以先写文字，停一下，再单独发回车。
+async function submitInput(s) {
+  await dinotty("POST", `/api/sessions/${s.paneId}/send`, { pane_id: s.paneId, command: "\r" }, s.paneToken);
+}
+
 async function sendPrompt(s, text) {
   const t = text.trim();
   // 多行用括号粘贴(bracketed paste)整体送进去，不然每个换行都会被当成一次提交
-  const payload = t.includes("\n") ? `\u001b[200~${t.replace(/\r?\n/g, "\n")}\u001b[201~\r` : `${t}\r`;
+  const payload = t.includes("\n") ? `\u001b[200~${t.replace(/\r?\n/g, "\n")}\u001b[201~` : t;
   await dinotty("POST", `/api/sessions/${s.paneId}/send`, { pane_id: s.paneId, command: payload }, s.paneToken);
+  await sleep(600);
+  await submitInput(s);
 }
 
 // ---------- transcript ----------
@@ -413,6 +421,8 @@ async function runTurn(s, ev) {
     const file = transcriptPath(s);
     let offset = await fileSize(file);
     await sendPrompt(s, ev.content);
+    const sentAt = Date.now(); // "没送进去"的判断从真正发出去算起，不含启动终端的时间
+    let resubmitted = false;
 
     let promptSeen = false;
     let done = false;
@@ -462,7 +472,15 @@ async function runTurn(s, ev) {
         break;
       }
 
-      if (!promptSeen && elapsed > 30000) throw new Error("消息没有送进 Claude（30 秒内没看到它收到），去 dinotty 看看终端是不是卡在别的提示上");
+      if (!promptSeen) {
+        const sinceSent = Date.now() - sentAt;
+        // 8 秒还没收到，多半是回车没生效，补发一次
+        if (sinceSent > 8000 && !resubmitted) {
+          resubmitted = true;
+          await submitInput(s);
+        }
+        if (sinceSent > 30000) throw new Error("消息没有送进 Claude（30 秒内没看到它收到），发 /screen 看看终端卡在哪");
+      }
 
       if (Date.now() - lastEdit >= PROGRESS_EDIT_MS) {
         lastEdit = Date.now();
@@ -557,6 +575,7 @@ const HELP_TOPICS = {
     body: [
       "在会话帖子里直接发消息，就是在跟这个帖子的 Claude 说话；多行消息会整体发过去。",
       "可以直接发图片和文件(主频道发给 2B 也行)：附件会下载到电脑上，Claude 和 2B 都能看到图片、读取文件。单个附件最大 50MB。",
+      "在帖子里 **@2B**：这条消息交给 2B，她会看着这个帖子的上下文在帖子里回答(比如帮你解释报错)，不会发给 Claude。",
       "**你的消息上的表情**：👀 收到 → ⏳ 处理中 → ✅ 完成 / ❌ 出错 / ⏹️ 已中止",
       "**进度消息**：处理期间每 5 秒刷新一次，显示已用时间和最近 5 个动作(读了哪个文件、跑了什么命令)，结束后变成「✅ 完成 · 用时 · 工具调用次数」。",
       "**帖子标签**：进行中 / 等待中 / 已完成，在论坛列表里一眼看到哪个会话在跑。",
@@ -1016,6 +1035,12 @@ async function handleMessage(ev) {
   const hasAttachments = Boolean(ev.attachments?.length);
 
   if (ev.thread_id) {
+    // 在帖子里 @2B：这条交给 2B，在帖子里回答，不发给这个帖子的 Claude
+    if (mentions2b(text)) {
+      await react(ev.thread_id, ev.message_id, "👀");
+      enqueue(TWOB_QUEUE, () => run2bTurn(ev, { channelId: ev.thread_id, inThread: true }));
+      return;
+    }
     const s = state.sessions[ev.thread_id];
     if (!s || (!text && !hasAttachments)) return;
     if (text.startsWith("/")) return handleThreadCommand(s, ev, text);
@@ -1107,15 +1132,39 @@ function runPi(prompt, images = []) {
   });
 }
 
-async function run2bTurn(ev) {
-  const ch = DISCORD_CHANNEL_ID;
+let BOT_USER_ID = null; // 启动时从 /users/@me 取，用来识别 @2B
+const mentionPattern = () => new RegExp(`<@!?${BOT_USER_ID}>`, "g");
+const mentions2b = (text) => Boolean(BOT_USER_ID) && mentionPattern().test(text);
+
+// 2B 在帖子里被 @ 时，给她看这个帖子最近的对话和会话状态
+async function threadContext(threadId, currentMessageId) {
+  const s = state.sessions[threadId];
+  const title = s?.title ?? (await discord("GET", `/channels/${threadId}`).catch(() => null))?.name ?? "未知帖子";
+  const msgs = await discord("GET", `/channels/${threadId}/messages?limit=15`).catch(() => []);
+  const lines = msgs
+    .filter((m) => m.id !== currentMessageId)
+    .reverse()
+    .map((m) => {
+      const who = m.webhook_id ? "Claude Code" : m.author.id === BOT_USER_ID ? "2B/桥接" : m.author.username;
+      const body = (m.content || (m.attachments?.length ? "[附件]" : "")).replace(/\s+/g, " ").slice(0, 300);
+      return body ? `${who}: ${body}` : null;
+    })
+    .filter(Boolean);
+  const status = s ? (s.busy ? `这个帖子的 Claude 正在做「${s.currentTask}」` : "这个帖子的 Claude 现在空闲") : "这个帖子没有绑定 Claude Code 会话";
+  return `[zym 在帖子 <#${threadId}>「${title}」里 @ 了你，你的回复会发在这个帖子里。${status}。thread_id=${threadId}\n这个帖子最近的消息(从旧到新)：\n${lines.join("\n")}\n]\n\n`;
+}
+
+async function run2bTurn(ev, { channelId = DISCORD_CHANNEL_ID, inThread = false } = {}) {
+  const ch = channelId;
   const typing = () => quietly(discord("POST", `/channels/${ch}/typing`), "typing");
   await typing();
   const timer = setInterval(typing, 8000); // "2B 正在输入…" 每次只持续约 10 秒，要不停续
   try {
     const files = await downloadAttachments(ev);
     const images = files.filter((f) => f.isImage && f.path).map((f) => f.path);
-    const reply = await runPi(`${ev.content.trim() || "(看附件)"}${attachmentNote(files)}`, images);
+    const said = (BOT_USER_ID ? ev.content.replace(mentionPattern(), "") : ev.content).trim();
+    const prefix = inThread ? await threadContext(ch, ev.message_id) : "";
+    const reply = await runPi(`${prefix}${said || "(看附件)"}${attachmentNote(files)}`, images);
     await postLong(ch, reply, toMain);
     await react(ch, ev.message_id, "👀", true);
     await react(ch, ev.message_id, "✅");
@@ -1309,6 +1358,7 @@ async function tick() {
 for (;;) {
   try {
     await ensureTags();
+    BOT_USER_ID = (await discord("GET", "/users/@me")).id;
     break;
   } catch (e) {
     console.error("[forum] 初始化标签失败，10 秒后重试:", e.message);
