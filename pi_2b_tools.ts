@@ -30,16 +30,6 @@ async function ensureTab(browser: string, cdp: string, url?: string) {
   await sleep(4000);
 }
 
-// 把 Duo 匹配码这类通知实时发到 Discord(tars-pilot 默认只弹 Windows 通知，用户在外面看不到)
-async function forwardNotices(run: any, sent: Set<string>) {
-  for (const line of Array.isArray(run.log) ? run.log : []) {
-    const text = typeof line === "string" ? line : JSON.stringify(line);
-    const m = text.match(/\[通知\]\s*(.+)/);
-    if (!m || sent.has(m[1])) continue;
-    sent.add(m[1]);
-    await call("POST", "/notify", { text: `🔔 网页操作需要你：${m[1]}` }).catch(() => {});
-  }
-}
 
 async function tars(method: string, route: string, body?: unknown) {
   const res = await fetch(`${TARS}${route}`, {
@@ -208,11 +198,10 @@ export default function (pi: ExtensionAPI) {
       const started = await tars("POST", "/runs", { ...req, wait: false });
       const runId = started.id;
       const deadline = Date.now() + TARS_WAIT_MS;
-      const sent = new Set<string>();
+      // 进度和 Duo 匹配码由桥接里的 tars_watch 在「网页操作」频道播报(并 @ 用户)，这里只等结果
       while (Date.now() < deadline) {
         await sleep(3000);
         const run = await tars("GET", `/runs/${runId}`);
-        await forwardNotices(run, sent);
         if (!["queued", "running"].includes(run.status)) return asResult(summarizeRun(run));
       }
       return asResult({ run_id: runId, status: "running", note: "还没做完，稍后用 tars_status 查结果" });

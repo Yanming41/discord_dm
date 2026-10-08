@@ -33,6 +33,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadEnv } from "./load_env.mjs";
+import { startTarsWatch } from "./tars_watch.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -619,6 +620,7 @@ const HELP_TOPICS = {
       "• 在**主频道**发 `睡眠` 或 `sleep`：电脑会回一句晚安，然后进入睡眠。",
       "• 只有你本人(DISCORD_OWNER_ID)发的消息才会被处理，别人发的指令会被忽略。",
       "• 2B 前台的用法见 `/help 2b`。",
+      "• **「网页操作」频道**：tars-pilot 的播报。不管谁调用了网页操作(2B、小红书脚本…)，这里都会出现一张任务卡片，实时显示第几步、在做什么，结束后变成结果；需要批准 Duo 时会 @ 你。",
     ],
   },
 };
@@ -1382,5 +1384,9 @@ for (;;) {
 }
 await saveState();
 startApiServer();
+// tars-pilot 播报员：自己初始化、自己重试，不阻塞桥接启动
+startTarsWatch({ token: DISCORD_TOKEN, guildId: env.DISCORD_GUILD_ID, mainChannelId: DISCORD_CHANNEL_ID, ownerId: DISCORD_OWNER_ID }).catch((e) =>
+  console.error("[tars-watch] 启动失败:", e.message)
+);
 console.log(`[discord_bridge] 启动，会话 ${Object.keys(state.sessions).length} 个，inbox 从第 ${state.inboxLines} 行开始`);
 setInterval(() => tick().catch((e) => console.error("[tick]", e.message)), POLL_MS);
