@@ -575,7 +575,7 @@ const HELP_TOPICS = {
     body: [
       "在会话帖子里直接发消息，就是在跟这个帖子的 Claude 说话；多行消息会整体发过去。",
       "可以直接发图片和文件(主频道发给 2B 也行)：附件会下载到电脑上，Claude 和 2B 都能看到图片、读取文件。单个附件最大 50MB。",
-      "在帖子里 **@2B**：这条消息交给 2B，她会看着这个帖子的上下文在帖子里回答(比如帮你解释报错)，不会发给 Claude。",
+      "在帖子里**以 @2B 开头**发消息：这条交给 2B，她会看着这个帖子的上下文在帖子里回答(比如帮你解释报错)，不会发给 Claude。正文中间提到 @2B 不算，照常发给 Claude。",
       "**你的消息上的表情**：👀 收到 → ⏳ 处理中 → ✅ 完成 / ❌ 出错 / ⏹️ 已中止",
       "**进度消息**：处理期间每 5 秒刷新一次，显示已用时间和最近 5 个动作(读了哪个文件、跑了什么命令)，结束后变成「✅ 完成 · 用时 · 工具调用次数」。",
       "**帖子标签**：进行中 / 等待中 / 已完成，在论坛列表里一眼看到哪个会话在跑。",
@@ -1035,8 +1035,8 @@ async function handleMessage(ev) {
   const hasAttachments = Boolean(ev.attachments?.length);
 
   if (ev.thread_id) {
-    // 在帖子里 @2B：这条交给 2B，在帖子里回答，不发给这个帖子的 Claude
-    if (mentions2b(text)) {
+    // 在帖子里以 @2B 开头：这条交给 2B，在帖子里回答，不发给这个帖子的 Claude
+    if (startsWith2bMention(text)) {
       await react(ev.thread_id, ev.message_id, "👀");
       enqueue(TWOB_QUEUE, () => run2bTurn(ev, { channelId: ev.thread_id, inThread: true }));
       return;
@@ -1134,7 +1134,9 @@ function runPi(prompt, images = []) {
 
 let BOT_USER_ID = null; // 启动时从 /users/@me 取，用来识别 @2B
 const mentionPattern = () => new RegExp(`<@!?${BOT_USER_ID}>`, "g");
-const mentions2b = (text) => Boolean(BOT_USER_ID) && mentionPattern().test(text);
+// 帖子里只有消息开头 @2B 才算叫她；正文中间提到 @2B / 她的 ID 只是普通文字，照常发给 Claude
+const leadingMentionPattern = () => new RegExp(`^\\s*<@!?${BOT_USER_ID}>\\s*`);
+const startsWith2bMention = (text) => Boolean(BOT_USER_ID) && leadingMentionPattern().test(text);
 
 // 2B 在帖子里被 @ 时，给她看这个帖子最近的对话和会话状态
 async function threadContext(threadId, currentMessageId) {
@@ -1162,7 +1164,9 @@ async function run2bTurn(ev, { channelId = DISCORD_CHANNEL_ID, inThread = false 
   try {
     const files = await downloadAttachments(ev);
     const images = files.filter((f) => f.isImage && f.path).map((f) => f.path);
-    const said = (BOT_USER_ID ? ev.content.replace(mentionPattern(), "") : ev.content).trim();
+    // 帖子里只去掉开头那个 @，正文里引用的 @2B 原样保留；主频道里所有 @ 都只是在叫她，全去掉
+    const pattern = inThread ? leadingMentionPattern() : mentionPattern();
+    const said = (BOT_USER_ID ? ev.content.replace(pattern, "") : ev.content).trim();
     const prefix = inThread ? await threadContext(ch, ev.message_id) : "";
     const reply = await runPi(`${prefix}${said || "(看附件)"}${attachmentNote(files)}`, images);
     await postLong(ch, reply, toMain);
