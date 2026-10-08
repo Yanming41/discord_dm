@@ -427,7 +427,7 @@ async function runTurn(s, ev) {
     const sentAt = Date.now(); // "没送进去"的判断从真正发出去算起，不含启动终端的时间
     let resubmitted = false;
 
-    let promptSeen = false;
+    let phase = "sending"; // sending → (queued →) active，见下面的循环
     let done = false;
     let interrupted = false;
     let permissionWarned = false;
@@ -451,8 +451,18 @@ async function runTurn(s, ev) {
           done = true;
           continue;
         }
-        if (!promptSeen) {
-          if (e.type === "user" && !isToolResult(content)) promptSeen = true;
+        // sending：等 Claude 收到。它空闲时会直接开新一轮(user 条目)；正在忙(比如自己接着干之前的活)时，
+        // 消息先进它的队列(queue-operation enqueue)。
+        if (phase === "sending") {
+          if (e.type === "user" && !isToolResult(content)) phase = "active";
+          else if (e.type === "queue-operation" && e.operation === "enqueue") phase = "queued";
+          continue;
+        }
+        // queued：排着队。之后要么被插进正在进行的这一轮(remove)，要么等这一轮结束后作为新一轮开始(dequeue)。
+        // 排队期间别的那一轮的内容不算回复；它结束(turn_duration)也不代表我们这条结束了。
+        if (phase === "queued") {
+          if (e.type === "queue-operation" && e.operation === "remove") phase = "active";
+          else if (e.type === "queue-operation" && e.operation === "dequeue") phase = "sending";
           continue;
         }
         if (e.type === "assistant" && Array.isArray(content)) {
@@ -475,7 +485,7 @@ async function runTurn(s, ev) {
         break;
       }
 
-      if (!promptSeen) {
+      if (phase === "sending") {
         const sinceSent = Date.now() - sentAt;
         // 8 秒还没收到，多半是回车没生效，补发一次
         if (sinceSent > 8000 && !resubmitted) {
@@ -493,7 +503,11 @@ async function runTurn(s, ev) {
           await postMessage(s.threadId, "⚠️ Claude 在等权限确认，请到 dinotty 的 cc-bridge 标签页处理，或者回复 /stop 中止。");
         }
         const recent = tools.length ? tools.slice(-5).map((t) => `• \`${t}\``).join("\n") : "思考中…";
-        await quietly(editMessage(s.threadId, progress, `⏳ Claude Code 工作中 · 已用 ${formatElapsed(elapsed)}\n${recent}`), "进度");
+        const text =
+          phase === "queued"
+            ? `⏳ Claude 正在做另一件事，你的消息已经排上了，它做完这一步就会接着处理 · 已等 ${formatElapsed(elapsed)}`
+            : `⏳ Claude Code 工作中 · 已用 ${formatElapsed(elapsed)}\n${recent}`;
+        await quietly(editMessage(s.threadId, progress, text), "进度");
       }
     }
 
@@ -722,6 +736,7 @@ async function openThreadSession(threadName, intro, sessionTitle, sessionOpts, r
 async function openNewCcSession(title, { cwd = DEFAULT_CWD, announce = true } = {}) {
   if (sessionLimitReached()) throw new BridgeError(LIMIT_MESSAGE, "limit");
   if (!existsSync(cwd)) throw new BridgeError(`目录不存在：${cwd}`, "bad_cwd");
+  title = title.replace(/^(\s*\[cc\]\s*)+/i, "").trim() || "未命名"; // 2B 有时自己带了 [cc]，别重复加
   return openThreadSession(`[cc] ${title}`, "Claude Code 新会话。终端启动中，好了会在这里说一声。", title, { cwd }, "🟢 Claude Code 已就绪，直接发消息吧。", { announce });
 }
 
