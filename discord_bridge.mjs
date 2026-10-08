@@ -33,7 +33,6 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadEnv } from "./load_env.mjs";
-import { startTarsWatch } from "./tars_watch.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -304,9 +303,12 @@ async function ensurePane(s) {
   if (await paneAlive(s)) return;
   await closePane(s);
   const resume = existsSync(transcriptPath(s));
+  // 通过 cmd 给 Claude 设两个环境变量：它调用 tars-pilot(Python 客户端)时会自动带上，
+  // tars-pilot 就把网页任务的进度卡片发到这个帖子里，不用 Claude 自己写频道(不占 token)
+  const claudeCmd = `claude ${resume ? "--resume" : "--session-id"} ${s.claudeSessionId}`;
   const tab = await dinotty("POST", "/api/tabs", {
     cwd: s.cwd.replace(/\\/g, "/"),
-    argv: ["claude", resume ? "--resume" : "--session-id", s.claudeSessionId],
+    argv: ["cmd.exe", "/d", "/s", "/c", `set TARS_DISCORD_CHANNEL=${s.threadId}&& set TARS_CALLER=Claude Code&& ${claudeCmd}`],
     title: `cc-bridge ${s.title}`.slice(0, 40),
   });
   s.tabId = tab.tab_id;
@@ -620,7 +622,7 @@ const HELP_TOPICS = {
       "• 在**主频道**发 `睡眠` 或 `sleep`：电脑会回一句晚安，然后进入睡眠。",
       "• 只有你本人(DISCORD_OWNER_ID)发的消息才会被处理，别人发的指令会被忽略。",
       "• 2B 前台的用法见 `/help 2b`。",
-      "• **tars-pilot**(网页操作员)：2B 让它操作网页时，它会以自己的身份出现在你们说话的那个频道或帖子里，发一张任务卡片，实时刷新第几步、在做什么，结束后变成结果；需要批准 Duo 和做完时会 @ 你。",
+      "• **tars-pilot**(网页操作员)：只要有人调用它操作网页(2B、帖子里的 Claude、脚本…)，它都会以自己的身份发一张任务卡片，实时刷新第几步、在做什么，结束后变成结果；需要批准 Duo 和做完时会 @ 你。2B 和帖子里的 Claude 调用时卡片发在对应的频道/帖子里，其他调用发在主频道。",
     ],
   },
 };
@@ -1390,9 +1392,5 @@ for (;;) {
 }
 await saveState();
 startApiServer();
-// tars-pilot 播报员：自己初始化、自己重试，不阻塞桥接启动
-startTarsWatch({ token: DISCORD_TOKEN, mainChannelId: DISCORD_CHANNEL_ID, forumChannelId: DISCORD_FORUM_CHANNEL_ID, ownerId: DISCORD_OWNER_ID }).catch((e) =>
-  console.error("[tars-watch] 启动失败:", e.message)
-);
 console.log(`[discord_bridge] 启动，会话 ${Object.keys(state.sessions).length} 个，inbox 从第 ${state.inboxLines} 行开始`);
 setInterval(() => tick().catch((e) => console.error("[tick]", e.message)), POLL_MS);
