@@ -1039,7 +1039,7 @@ async function handleMessage(ev) {
     // 在帖子里以 @2B 开头：这条交给 2B，在帖子里回答，不发给这个帖子的 Claude
     if (startsWith2bMention(text)) {
       await react(ev.thread_id, ev.message_id, "👀");
-      enqueue(TWOB_QUEUE, () => run2bTurn(ev, { channelId: ev.thread_id, inThread: true }));
+      enqueue(twoBQueue(ev.thread_id), () => run2bTurn(ev, { channelId: ev.thread_id, inThread: true }));
       return;
     }
     const s = state.sessions[ev.thread_id];
@@ -1068,7 +1068,7 @@ async function handleMessage(ev) {
   if ((!text && !hasAttachments) || text.startsWith("/")) return;
   // 其余的话都交给前台 2B
   await react(DISCORD_CHANNEL_ID, ev.message_id, "👀");
-  enqueue(TWOB_QUEUE, () => run2bTurn(ev));
+  enqueue(twoBQueue(DISCORD_CHANNEL_ID), () => run2bTurn(ev));
 }
 
 // ---------- 2B 前台(pi agent) ----------
@@ -1078,7 +1078,15 @@ async function handleMessage(ev) {
 // 工具：pi 自带的 read/bash/edit/write(轻量小活自己做)，加上 pi_2b_tools.ts 里经下面的本地接口调度 Claude Code、
 // 经 tars-pilot 做网页操作的工具。回复由 bot 发出，bot 名字就是 2B。
 
-const TWOB_QUEUE = "__2b__";
+// 每个地方(主频道、每个帖子)各有一个 2B 会话和一个队列：不同地方的 2B 并行回答，
+// 同一个地方内部按顺序(同一个 pi 会话文件不能被两个进程同时写)。长期记忆文件是共用的。
+const twoBQueue = (channelId) => `__2b__${channelId}`;
+state.threadTwoBSessions ??= {}; // threadId -> 这个帖子里 2B 的 pi session id
+function twoBSessionFor(channelId) {
+  if (channelId === DISCORD_CHANNEL_ID) return state.frontdeskSessionId;
+  state.threadTwoBSessions[channelId] ??= randomUUID();
+  return state.threadTwoBSessions[channelId];
+}
 const PI_CLI = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"), "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
 const TWOB_EXTENSION = path.join(__dirname, "pi_2b_tools.ts");
 const TWOB_PROMPT = path.join(__dirname, "2b_prompt.md");
@@ -1096,12 +1104,12 @@ const TWOB_TIMEOUT_MS = 15 * 60 * 1000; // 网页操作冷启动模型就要一�
 state.frontdeskSessionId ??= randomUUID();
 
 // images：本机图片路径，用 pi 的 @文件 参数传进去，2B 能直接看图；文字仍走标准输入，两者会合成一条消息
-function runPi(prompt, images = []) {
+function runPi(prompt, images = [], sessionId = state.frontdeskSessionId) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
       [
-        PI_CLI, "-p", "--session-id", state.frontdeskSessionId, "--no-extensions", "--no-context-files",
+        PI_CLI, "-p", "--session-id", sessionId, "--no-extensions", "--no-context-files",
         "-e", TWOB_EXTENSION, "--append-system-prompt", TWOB_PROMPT, "--append-system-prompt", TWOB_PROFILES,
         "--append-system-prompt", TWOB_MEMORY,
         ...images.map((p) => `@${p}`),
@@ -1169,7 +1177,9 @@ async function run2bTurn(ev, { channelId = DISCORD_CHANNEL_ID, inThread = false 
     const pattern = inThread ? leadingMentionPattern() : mentionPattern();
     const said = (BOT_USER_ID ? ev.content.replace(pattern, "") : ev.content).trim();
     const prefix = inThread ? await threadContext(ch, ev.message_id) : "";
-    const reply = await runPi(`${prefix}${said || "(看附件)"}${attachmentNote(files)}`, images);
+    const sessionId = twoBSessionFor(ch);
+    await saveState();
+    const reply = await runPi(`${prefix}${said || "(看附件)"}${attachmentNote(files)}`, images, sessionId);
     await postLong(ch, reply, toMain);
     await react(ch, ev.message_id, "👀", true);
     await react(ch, ev.message_id, "✅");
