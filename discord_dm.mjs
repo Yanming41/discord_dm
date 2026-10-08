@@ -94,6 +94,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline";
 import { loadEnv } from "./load_env.mjs";
+import { commandScope, toCommandText } from "./slash_commands.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUTBOX_FILE = path.join(__dirname, "outbox.jsonl");
@@ -292,26 +293,30 @@ async function checkOutbox() {
   await writeFile(OUTBOX_CURSOR_FILE, String(outboxLinesProcessed), "utf-8");
 }
 
-// 菜单里的 /stop(这个 bot 的应用早先已经注册过一个全局 /stop)：转成和在帖子里手打 "/stop" 一样的消息事件
-async function handleStopCommand(interaction) {
-  if (DISCORD_OWNER_ID && interaction.user.id !== DISCORD_OWNER_ID) {
-    await interaction.reply({ content: "只有主人能用这个命令。", ephemeral: true });
-    return;
-  }
+// 菜单里的斜杠命令(由 register_commands.mjs 注册)：还原成手打的那条文字，写成普通消息事件交给桥接处理。
+// Discord 要求 3 秒内回应，所以先回一条只有用户自己能看到的确认。
+async function handleSlashCommand(interaction) {
+  const reply = (content) => interaction.reply({ content, ephemeral: true });
+  if (DISCORD_OWNER_ID && interaction.user.id !== DISCORD_OWNER_ID) return reply("只有主人能用这些命令。");
+  const scope = commandScope(interaction.commandName);
+  if (!scope) return reply("这个命令已经不用了。");
+
   const ch = interaction.channel;
   const inForumThread = Boolean(DISCORD_FORUM_CHANNEL_ID) && ch?.isThread() && ch.parentId === DISCORD_FORUM_CHANNEL_ID;
-  if (!inForumThread) {
-    await interaction.reply({ content: "/stop 要在 Claude Code 的会话帖子里用。", ephemeral: true });
-    return;
-  }
-  await interaction.reply({ content: "⏹ 已发送中止。", ephemeral: true });
+  const inMainChannel = interaction.channelId === DISCORD_CHANNEL_ID;
+  if (scope === "thread" && !inForumThread) return reply(`/${interaction.commandName} 要在 Claude Code 的会话帖子里用。`);
+  if (scope === "main" && !inMainChannel) return reply(`/${interaction.commandName} 要在主频道用。`);
+  if (scope === "any" && !inForumThread && !inMainChannel) return reply("在主频道或者会话帖子里用。");
+
+  const text = toCommandText(interaction);
+  await reply(`收到：\`${text}\``);
   await appendFile(
     INBOX_FILE,
     JSON.stringify({
       type: "message",
       channel_id: interaction.channelId,
-      thread_id: interaction.channelId,
-      content: "/stop",
+      thread_id: inForumThread ? interaction.channelId : null,
+      content: text,
       attachments: [],
       message_id: null,
       author_id: interaction.user.id,
@@ -322,8 +327,8 @@ async function handleStopCommand(interaction) {
 }
 
 client.on("interactionCreate", async (interaction) => {
-  if (interaction.isChatInputCommand() && interaction.commandName === "stop") {
-    await handleStopCommand(interaction).catch((e) => console.error("[/stop] 处理失败:", e.message));
+  if (interaction.isChatInputCommand()) {
+    await handleSlashCommand(interaction).catch((e) => console.error(`[/${interaction.commandName}] 处理失败:`, e.message));
     return;
   }
   if (!interaction.isButton()) return;
