@@ -206,6 +206,44 @@ const toMain = { asClaude: false };
 
 const quietly = (p, what) => p.catch((e) => console.error(`[${what}]`, e.message));
 
+// ---------- 附件：下载到本机，把路径告诉 Claude / 2B ----------
+
+const ATTACH_DIR = path.join(DATA_DIR, "attachments");
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
+
+async function downloadAttachments(ev) {
+  const list = ev.attachments ?? [];
+  if (!list.length) return [];
+  const dir = path.join(ATTACH_DIR, new Date().toISOString().slice(0, 10));
+  await mkdir(dir, { recursive: true });
+  const saved = [];
+  for (const a of list) {
+    const safeName = String(a.name || "file").replace(/[\\/:*?"<>|\s]+/g, "_").slice(-120);
+    const isImage = String(a.content_type || "").startsWith("image/") || IMAGE_EXT.test(safeName);
+    if (a.size > MAX_ATTACHMENT_BYTES) {
+      saved.push({ name: a.name, isImage, error: `太大了(${Math.round(a.size / 1048576)}MB)，没下载` });
+      continue;
+    }
+    try {
+      const res = await fetch(a.url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const file = path.join(dir, `${ev.message_id}_${safeName}`);
+      await writeFile(file, Buffer.from(await res.arrayBuffer()));
+      saved.push({ name: a.name, isImage, path: file });
+    } catch (e) {
+      saved.push({ name: a.name, isImage, error: `下载失败：${e.message}` });
+    }
+  }
+  return saved;
+}
+
+function attachmentNote(files) {
+  if (!files.length) return "";
+  const lines = files.map((f) => (f.path ? `- ${f.path}${f.isImage ? " (图片)" : ""}` : `- ${f.name}：${f.error}`));
+  return `\n\n[用户发了附件，已保存到本机]\n${lines.join("\n")}`;
+}
+
 async function react(channelId, messageId, emoji, remove = false) {
   const route = `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`;
   await quietly(discord(remove ? "DELETE" : "PUT", route), `表情 ${emoji}`);
@@ -518,6 +556,7 @@ const HELP_TOPICS = {
     title: "聊天和状态显示",
     body: [
       "在会话帖子里直接发消息，就是在跟这个帖子的 Claude 说话；多行消息会整体发过去。",
+      "可以直接发图片和文件(主频道发给 2B 也行)：附件会下载到电脑上，Claude 和 2B 都能看到图片、读取文件。单个附件最大 50MB。",
       "**你的消息上的表情**：👀 收到 → ⏳ 处理中 → ✅ 完成 / ❌ 出错 / ⏹️ 已中止",
       "**进度消息**：处理期间每 5 秒刷新一次，显示已用时间和最近 5 个动作(读了哪个文件、跑了什么命令)，结束后变成「✅ 完成 · 用时 · 工具调用次数」。",
       "**帖子标签**：进行中 / 等待中 / 已完成，在论坛列表里一眼看到哪个会话在跑。",
@@ -974,12 +1013,18 @@ async function handleMessage(ev) {
   if (ev.author_id !== DISCORD_OWNER_ID) return;
   const text = ev.content.trim();
 
+  const hasAttachments = Boolean(ev.attachments?.length);
+
   if (ev.thread_id) {
     const s = state.sessions[ev.thread_id];
-    if (!s || !text) return;
+    if (!s || (!text && !hasAttachments)) return;
     if (text.startsWith("/")) return handleThreadCommand(s, ev, text);
     await react(s.threadId, ev.message_id, "👀");
-    enqueue(s.threadId, () => runTurn(s, ev));
+    enqueue(s.threadId, async () => {
+      // Claude Code 能直接读本机的图片和文件，告诉它路径就行
+      const files = await downloadAttachments(ev);
+      await runTurn(s, { ...ev, content: `${text || "(看附件)"}${attachmentNote(files)}` });
+    });
     return;
   }
 
@@ -994,7 +1039,7 @@ async function handleMessage(ev) {
   const help = text.match(/^\/help(?:\s+(.*))?$/s);
   if (help) return showHelp(DISCORD_CHANNEL_ID, help[1] ?? "", toMain);
   if (text === "/2b new") return reset2b();
-  if (!text || text.startsWith("/")) return;
+  if ((!text && !hasAttachments) || text.startsWith("/")) return;
   // 其余的话都交给前台 2B
   await react(DISCORD_CHANNEL_ID, ev.message_id, "👀");
   enqueue(TWOB_QUEUE, () => run2bTurn(ev));
@@ -1024,7 +1069,8 @@ if (!existsSync(TWOB_MEMORY)) {
 const TWOB_TIMEOUT_MS = 15 * 60 * 1000; // 网页操作冷启动模型就要一分多钟，留足时间
 state.frontdeskSessionId ??= randomUUID();
 
-function runPi(prompt) {
+// images：本机图片路径，用 pi 的 @文件 参数传进去，2B 能直接看图；文字仍走标准输入，两者会合成一条消息
+function runPi(prompt, images = []) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -1032,6 +1078,7 @@ function runPi(prompt) {
         PI_CLI, "-p", "--session-id", state.frontdeskSessionId, "--no-extensions", "--no-context-files",
         "-e", TWOB_EXTENSION, "--append-system-prompt", TWOB_PROMPT, "--append-system-prompt", TWOB_PROFILES,
         "--append-system-prompt", TWOB_MEMORY,
+        ...images.map((p) => `@${p}`),
       ],
       {
         cwd: HOME,
@@ -1066,7 +1113,9 @@ async function run2bTurn(ev) {
   await typing();
   const timer = setInterval(typing, 8000); // "2B 正在输入…" 每次只持续约 10 秒，要不停续
   try {
-    const reply = await runPi(ev.content);
+    const files = await downloadAttachments(ev);
+    const images = files.filter((f) => f.isImage && f.path).map((f) => f.path);
+    const reply = await runPi(`${ev.content.trim() || "(看附件)"}${attachmentNote(files)}`, images);
     await postLong(ch, reply, toMain);
     await react(ch, ev.message_id, "👀", true);
     await react(ch, ev.message_id, "✅");

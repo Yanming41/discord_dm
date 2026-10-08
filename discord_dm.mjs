@@ -48,7 +48,8 @@
 //      {"thread_id":"...", "set_tags": {"status_tag":"已完成", "domain_tag":"..."}}  // 两个字段都可选，只传要改的
 //
 // inbox 里还会有两类事件：
-//   {"type":"message", "channel_id", "thread_id"(主频道为null，论坛帖子里为帖子ID), "content", "author_id", "message_id", "ts"}
+//   {"type":"message", "channel_id", "thread_id"(主频道为null，论坛帖子里为帖子ID), "content",
+//    "attachments": [{"url","name","content_type","size"}], "author_id", "message_id", "ts"}
 //     —— 配置频道或论坛帖子里 DISCORD_OWNER_ID 本人发的消息(睡眠关键词除外)
 //   {"type":"forum_post_created", "ref", "thread_id", "title", "ts"} —— 格式4建帖子的回执
 //
@@ -337,6 +338,7 @@ client.on("messageCreate", async (message) => {
       channel_id: message.channelId,
       thread_id: inForumThread ? message.channelId : null,
       content,
+      attachments: [...message.attachments.values()].map((a) => ({ url: a.url, name: a.name, content_type: a.contentType, size: a.size })),
       message_id: message.id,
       author_id: message.author.id,
       ts: Date.now(),
