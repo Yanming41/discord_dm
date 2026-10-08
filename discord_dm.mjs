@@ -292,7 +292,40 @@ async function checkOutbox() {
   await writeFile(OUTBOX_CURSOR_FILE, String(outboxLinesProcessed), "utf-8");
 }
 
+// 菜单里的 /stop(这个 bot 的应用早先已经注册过一个全局 /stop)：转成和在帖子里手打 "/stop" 一样的消息事件
+async function handleStopCommand(interaction) {
+  if (DISCORD_OWNER_ID && interaction.user.id !== DISCORD_OWNER_ID) {
+    await interaction.reply({ content: "只有主人能用这个命令。", ephemeral: true });
+    return;
+  }
+  const ch = interaction.channel;
+  const inForumThread = Boolean(DISCORD_FORUM_CHANNEL_ID) && ch?.isThread() && ch.parentId === DISCORD_FORUM_CHANNEL_ID;
+  if (!inForumThread) {
+    await interaction.reply({ content: "/stop 要在 Claude Code 的会话帖子里用。", ephemeral: true });
+    return;
+  }
+  await interaction.reply({ content: "⏹ 已发送中止。", ephemeral: true });
+  await appendFile(
+    INBOX_FILE,
+    JSON.stringify({
+      type: "message",
+      channel_id: interaction.channelId,
+      thread_id: interaction.channelId,
+      content: "/stop",
+      attachments: [],
+      message_id: null,
+      author_id: interaction.user.id,
+      ts: Date.now(),
+    }) + "\n",
+    "utf-8"
+  );
+}
+
 client.on("interactionCreate", async (interaction) => {
+  if (interaction.isChatInputCommand() && interaction.commandName === "stop") {
+    await handleStopCommand(interaction).catch((e) => console.error("[/stop] 处理失败:", e.message));
+    return;
+  }
   if (!interaction.isButton()) return;
   stats.buttonClicks++;
   // Discord要求3秒内必须响应交互——占住它，具体回什么内容是外部程序的事，
