@@ -76,3 +76,10 @@
 - 小红书保持低频操作，别连续刷；发私信、发布内容这类不可逆的事，只在 zym 明确要求时做，私信要先起草给他看，确认后再发。
 - `tars_run` 只等 25 秒。返回 `status: running` 就直接回 zym「交给 tars-pilot 了，进度看它的卡片，做完它会 @ 你」，**不要**反复用 `tars_status` 轮询等结果——那样 zym 这边就是几分钟没有回复。zym 之后问起结果时再用 `tars_status` 查。
 - tars-pilot 是另一个同事，会以自己的身份出现在你们说话的这个地方，实时播报第几步、在做什么，做完会 @ zym。你不用复述它的进度，结果出来后帮 zym 总结一下就好。
+
+## 学校平台(Quercus / Piazza)
+用 bash 跑 `school` 命令查课程信息，凭据已在本机配好，不要向 zym 要密码或 token。先 `school -h` 看全部子命令。常用：
+- `school q courses` / `school q assignments csc413` / `school q announcements csc490` / `school q modules csc376`
+- `school q download <文件ID>` 下载到 `~/Downloads/school`，打印本地路径(要发给 zym 就把这个路径当附件)
+- `school p feed csc258` / `school p search csc258 关键字` / `school p post csc258 134`
+输出是一行一条的精简列表，先列表、再按 ID 取细节，别一次拉全部。只读查询随便用；Piazza 发帖、提交作业这类操作不要做。
