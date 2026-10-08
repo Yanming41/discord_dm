@@ -1,12 +1,14 @@
 // tars_watch.mjs
 //
-// tars-pilot 的 Discord 播报员。盯着 tars-pilot(127.0.0.1:8765)的任务队列，不管是谁调用的
-// (2B、小红书脚本、命令行…)，都在「网页操作」频道里以 tars-pilot 的身份播报：
+// tars-pilot 的 Discord 身份。盯着 tars-pilot(127.0.0.1:8765)的任务队列，哪里调用的就在哪里出现：
+// 请求里带了 discord_channel_id(主频道，或者论坛里某个帖子的 ID)，就以 tars-pilot 的身份在那里播报：
 //   收到任务 → 一张卡片，执行中原地刷新(第几步、当前进度、最近动作) → 结束时变成结果
-// Duo 匹配码这类要用户马上处理的通知([通知] 开头的日志行)单独发一条并 @ 用户，手机会响。
+// 需要用户马上处理的通知([通知] 开头的日志行，比如 Duo 匹配码)和任务结束时，各发一条 @ 用户。
+// 没带 discord_channel_id 的调用(小红书脚本、命令行等)不播报。
 //
-// 频道和 webhook 第一次运行时自动创建，记在 ~/.discord_dm/tars_watch_state.json。
-// 由 discord_bridge.mjs 启动：startTarsWatch({ token, guildId, mainChannelId, ownerId })
+// 主频道和论坛频道各需要一个 tars-pilot webhook(帖子用论坛那个，加 thread_id)，第一次运行时自动创建，
+// 记在 ~/.discord_dm/tars_watch_state.json。
+// 由 discord_bridge.mjs 启动：startTarsWatch({ token, mainChannelId, forumChannelId, ownerId })
 
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -15,7 +17,6 @@ import os from "node:os";
 
 const TARS = "http://127.0.0.1:8765";
 const STATE_FILE = path.join(os.homedir(), ".discord_dm", "tars_watch_state.json");
-const CHANNEL_NAME = "网页操作";
 const POLL_MS = 3000;
 const EDIT_MS = 5000;
 const DEFAULT_MAX_STEPS = 25;
@@ -113,7 +114,7 @@ const isActive = (status) => status === "queued" || status === "running";
 
 // ---------- Discord ----------
 
-export async function startTarsWatch({ token, guildId, mainChannelId, ownerId }) {
+export async function startTarsWatch({ token, mainChannelId, forumChannelId, ownerId }) {
   const api = async (method, route, body) => {
     for (let attempt = 0; attempt < 3; attempt++) {
       const res = await fetch(`https://discord.com/api/v10${route}`, {
@@ -126,59 +127,52 @@ export async function startTarsWatch({ token, guildId, mainChannelId, ownerId })
         continue;
       }
       const text = await res.text();
-      if (!res.ok) throw Object.assign(new Error(`${method} ${route} -> HTTP ${res.status}: ${text.slice(0, 200)}`), { status: res.status });
+      if (!res.ok) throw new Error(`${method} ${route} -> HTTP ${res.status}: ${text.slice(0, 200)}`);
       return text ? JSON.parse(text) : null;
     }
     throw new Error("Discord 多次限流");
   };
 
-  const state = existsSync(STATE_FILE) ? JSON.parse(await readFile(STATE_FILE, "utf-8")) : { channelId: null, webhookUrl: null, runs: {}, primed: false };
+  const loaded = existsSync(STATE_FILE) ? JSON.parse(await readFile(STATE_FILE, "utf-8")) : {};
+  const state = { webhooks: loaded.webhooks ?? {}, runs: loaded.runs ?? {}, primed: Boolean(loaded.primed) };
   const save = () => writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
 
-  // 频道：先看记下的还在不在，再按名字找，都没有就建在主频道同一个分类下
-  async function ensureChannel() {
-    if (state.channelId) {
-      const ok = await api("GET", `/channels/${state.channelId}`).catch(() => null);
-      if (ok) return;
-      state.webhookUrl = null;
+  // 主频道、论坛频道各一个 tars-pilot webhook
+  async function ensureWebhooks() {
+    for (const parentId of [mainChannelId, forumChannelId].filter(Boolean)) {
+      if (state.webhooks[parentId]) continue;
+      const hook = await api("POST", `/channels/${parentId}/webhooks`, { name: "tars-pilot" });
+      state.webhooks[parentId] = `https://discord.com/api/webhooks/${hook.id}/${hook.token}`;
     }
-    const channels = await api("GET", `/guilds/${guildId}/channels`);
-    let ch = channels.find((c) => c.type === 0 && c.name === CHANNEL_NAME);
-    if (!ch) {
-      const parent = channels.find((c) => c.id === mainChannelId)?.parent_id ?? undefined;
-      ch = await api("POST", `/guilds/${guildId}/channels`, {
-        name: CHANNEL_NAME,
-        type: 0,
-        parent_id: parent,
-        topic: "tars-pilot 的任务播报：谁调用了网页操作、每一步进度、结果。Duo 匹配码会在这里 @ 你。",
-      });
-    }
-    state.channelId = ch.id;
   }
 
-  async function ensureWebhook() {
-    if (state.webhookUrl) return;
-    const hook = await api("POST", `/channels/${state.channelId}/webhooks`, { name: "tars-pilot" });
-    state.webhookUrl = `https://discord.com/api/webhooks/${hook.id}/${hook.token}`;
-  }
+  // 调用方给的频道：主频道直接发；其他的当作论坛里的帖子，用论坛的 webhook 加 thread_id
+  const target = (channelId) =>
+    channelId === mainChannelId
+      ? { url: state.webhooks[mainChannelId], query: "" }
+      : { url: state.webhooks[forumChannelId], query: `thread_id=${channelId}` };
 
-  const hookPost = async (content, allowed = NO_MENTIONS) => {
-    const res = await fetch(`${state.webhookUrl}?wait=true`, {
+  async function hookPost(channelId, content, mention = false) {
+    const t = target(channelId);
+    const qs = ["wait=true", t.query].filter(Boolean).join("&");
+    const res = await fetch(`${t.url}?${qs}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content, allowed_mentions: allowed }),
+      body: JSON.stringify({ content, allowed_mentions: mention ? { users: [ownerId] } : NO_MENTIONS }),
     });
     if (!res.ok) throw new Error(`webhook 发送失败 HTTP ${res.status}`);
     return res.json();
-  };
-  const hookEdit = async (messageId, content) => {
-    const res = await fetch(`${state.webhookUrl}/messages/${messageId}`, {
+  }
+
+  async function hookEdit(channelId, messageId, content) {
+    const t = target(channelId);
+    const res = await fetch(`${t.url}/messages/${messageId}${t.query ? `?${t.query}` : ""}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content, allowed_mentions: NO_MENTIONS }),
     });
     if (!res.ok) throw new Error(`webhook 编辑失败 HTTP ${res.status}`);
-  };
+  }
 
   const tars = async (route) => {
     const res = await fetch(`${TARS}${route}`);
@@ -192,8 +186,7 @@ export async function startTarsWatch({ token, guildId, mainChannelId, ownerId })
 
   for (;;) {
     try {
-      await ensureChannel();
-      await ensureWebhook();
+      await ensureWebhooks();
       // 第一次运行：已有的历史任务不播报，只播报之后新来的
       if (!state.primed) {
         const existing = await listRuns().catch(() => []);
@@ -207,7 +200,7 @@ export async function startTarsWatch({ token, guildId, mainChannelId, ownerId })
       await sleep(30000);
     }
   }
-  console.log(`[tars-watch] 在 #${CHANNEL_NAME} 播报 tars-pilot 的任务`);
+  console.log("[tars-watch] tars-pilot 会在调用它的频道/帖子里播报");
 
   let lastErrorLog = 0;
   let ticking = false;
@@ -219,15 +212,21 @@ export async function startTarsWatch({ token, guildId, mainChannelId, ownerId })
       for (const summary of runs) {
         const rec = state.runs[summary.id] ?? (state.runs[summary.id] = {});
         if (rec.done) continue;
+        const channelId = summary.request?.discord_channel_id;
+        if (!channelId) {
+          rec.done = true; // 不是从 Discord 发起的，不播报
+          continue;
+        }
         const run = isActive(summary.status) || !summary.log ? await tars(`/runs/${summary.id}`) : summary;
         const card = renderCard(run);
+        const shortId = String(run.id).slice(0, 8);
 
         if (!rec.messageId) {
-          rec.messageId = (await hookPost(card)).id;
+          rec.messageId = (await hookPost(channelId, card)).id;
           rec.lastCard = card;
           rec.lastEdit = Date.now();
         } else if (card !== rec.lastCard && (!isActive(run.status) || Date.now() - rec.lastEdit >= EDIT_MS)) {
-          await hookEdit(rec.messageId, card);
+          await hookEdit(channelId, rec.messageId, card);
           rec.lastCard = card;
           rec.lastEdit = Date.now();
         }
@@ -235,11 +234,15 @@ export async function startTarsWatch({ token, guildId, mainChannelId, ownerId })
         const notices = parseLog(run.log).notices;
         rec.noticesSent ??= 0;
         for (const n of notices.slice(rec.noticesSent)) {
-          await hookPost(`🔔 <@${ownerId}> 网页任务 \`${String(run.id).slice(0, 8)}\` 需要你：${n}`, { users: [ownerId] });
+          await hookPost(channelId, `🔔 <@${ownerId}> 网页任务 \`${shortId}\` 需要你：${n}`, true);
         }
         rec.noticesSent = notices.length;
 
-        if (!isActive(run.status)) rec.done = true;
+        if (!isActive(run.status)) {
+          const verdict = run.status === "done" ? "✅ 完成了" : run.status === "cancelled" ? "⏹ 已取消" : "❌ 没完成";
+          await hookPost(channelId, `<@${ownerId}> 网页任务 \`${shortId}\` ${verdict}，详情见上面的卡片。`, true);
+          rec.done = true;
+        }
       }
       // 只留最近的记录，免得状态文件越来越大
       const ids = Object.keys(state.runs);

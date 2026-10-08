@@ -195,10 +195,12 @@ export default function (pi: ExtensionAPI) {
       await ensureTars();
       const { url, ...req } = params;
       await ensureTab(req.browser, req.cdp, url);
-      const started = await tars("POST", "/runs", { ...req, wait: false });
+      // 带上 2B 当前所在的频道/帖子：桥接里的 tars_watch 会以 tars-pilot 的身份在那里播报进度
+      const origin = process.env.DISCORD_2B_CHANNEL ? { discord_channel_id: process.env.DISCORD_2B_CHANNEL, caller: "2B" } : {};
+      const started = await tars("POST", "/runs", { ...req, ...origin, wait: false });
       const runId = started.id;
       const deadline = Date.now() + TARS_WAIT_MS;
-      // 进度和 Duo 匹配码由桥接里的 tars_watch 在「网页操作」频道播报(并 @ 用户)，这里只等结果
+      // 进度和 Duo 匹配码由桥接里的 tars_watch 在调用的那个频道/帖子里播报(并 @ 用户)，这里只等结果
       while (Date.now() < deadline) {
         await sleep(3000);
         const run = await tars("GET", `/runs/${runId}`);

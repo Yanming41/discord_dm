@@ -620,7 +620,7 @@ const HELP_TOPICS = {
       "• 在**主频道**发 `睡眠` 或 `sleep`：电脑会回一句晚安，然后进入睡眠。",
       "• 只有你本人(DISCORD_OWNER_ID)发的消息才会被处理，别人发的指令会被忽略。",
       "• 2B 前台的用法见 `/help 2b`。",
-      "• **「网页操作」频道**：tars-pilot 的播报。不管谁调用了网页操作(2B、小红书脚本…)，这里都会出现一张任务卡片，实时显示第几步、在做什么，结束后变成结果；需要批准 Duo 时会 @ 你。",
+      "• **tars-pilot**(网页操作员)：2B 让它操作网页时，它会以自己的身份出现在你们说话的那个频道或帖子里，发一张任务卡片，实时刷新第几步、在做什么，结束后变成结果；需要批准 Duo 和做完时会 @ 你。",
     ],
   },
 };
@@ -1106,7 +1106,8 @@ const TWOB_TIMEOUT_MS = 15 * 60 * 1000; // 网页操作冷启动模型就要一�
 state.frontdeskSessionId ??= randomUUID();
 
 // images：本机图片路径，用 pi 的 @文件 参数传进去，2B 能直接看图；文字仍走标准输入，两者会合成一条消息
-function runPi(prompt, images = [], sessionId = state.frontdeskSessionId) {
+// channelId：2B 这次是在哪个频道/帖子里回答的，传给她的工具(tars-pilot 会在那里播报进度)
+function runPi(prompt, images = [], sessionId = state.frontdeskSessionId, channelId = DISCORD_CHANNEL_ID) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -1119,7 +1120,12 @@ function runPi(prompt, images = [], sessionId = state.frontdeskSessionId) {
       {
         cwd: HOME,
         windowsHide: true,
-        env: { ...process.env, DISCORD_BRIDGE_API: `http://127.0.0.1:${API_PORT}`, DISCORD_BRIDGE_TOKEN_FILE: API_TOKEN_FILE },
+        env: {
+          ...process.env,
+          DISCORD_BRIDGE_API: `http://127.0.0.1:${API_PORT}`,
+          DISCORD_BRIDGE_TOKEN_FILE: API_TOKEN_FILE,
+          DISCORD_2B_CHANNEL: channelId,
+        },
       }
     );
     let out = "";
@@ -1181,7 +1187,7 @@ async function run2bTurn(ev, { channelId = DISCORD_CHANNEL_ID, inThread = false 
     const prefix = inThread ? await threadContext(ch, ev.message_id) : "";
     const sessionId = twoBSessionFor(ch);
     await saveState();
-    const reply = await runPi(`${prefix}${said || "(看附件)"}${attachmentNote(files)}`, images, sessionId);
+    const reply = await runPi(`${prefix}${said || "(看附件)"}${attachmentNote(files)}`, images, sessionId, ch);
     await postLong(ch, reply, toMain);
     await react(ch, ev.message_id, "👀", true);
     await react(ch, ev.message_id, "✅");
@@ -1385,7 +1391,7 @@ for (;;) {
 await saveState();
 startApiServer();
 // tars-pilot 播报员：自己初始化、自己重试，不阻塞桥接启动
-startTarsWatch({ token: DISCORD_TOKEN, guildId: env.DISCORD_GUILD_ID, mainChannelId: DISCORD_CHANNEL_ID, ownerId: DISCORD_OWNER_ID }).catch((e) =>
+startTarsWatch({ token: DISCORD_TOKEN, mainChannelId: DISCORD_CHANNEL_ID, forumChannelId: DISCORD_FORUM_CHANNEL_ID, ownerId: DISCORD_OWNER_ID }).catch((e) =>
   console.error("[tars-watch] 启动失败:", e.message)
 );
 console.log(`[discord_bridge] 启动，会话 ${Object.keys(state.sessions).length} 个，inbox 从第 ${state.inboxLines} 行开始`);
