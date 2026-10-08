@@ -1311,6 +1311,10 @@ async function run2bTurn(ev, { channelId = DISCORD_CHANNEL_ID, inThread = false 
   const typing = () => quietly(discord("POST", `/channels/${ch}/typing`), "typing");
   await typing();
   const timer = setInterval(typing, 8000); // "2B 正在输入…" 每次只持续约 10 秒，要不停续
+  // 记下正在回复的消息：万一桥接中途被重启/崩溃，下次启动时能告诉用户这条被打断了，而不是一直停在 👀
+  const flightKey = ev.message_id ?? randomUUID();
+  state.twoBInFlight[flightKey] = { channelId: ch, messageId: ev.message_id ?? null, preview: ev.content.slice(0, 40), startedAt: Date.now() };
+  await saveState();
   try {
     const files = await downloadAttachments(ev);
     const images = files.filter((f) => f.isImage && f.path).map((f) => f.path);
@@ -1331,7 +1335,24 @@ async function run2bTurn(ev, { channelId = DISCORD_CHANNEL_ID, inThread = false 
     await react(ch, ev.message_id, "❌");
   } finally {
     clearInterval(timer);
+    delete state.twoBInFlight[flightKey];
+    await saveState();
   }
+}
+
+// 启动时：上次没回复完的 2B 消息(被重启/崩溃打断的)，在原处说一声，把 👀 换成 ❌
+state.twoBInFlight ??= {};
+async function reportInterrupted2b() {
+  for (const [key, f] of Object.entries(state.twoBInFlight)) {
+    const where = f.preview ? `「${f.preview.replace(/\s+/g, " ").replace(/<@!?\d+>/g, "@2B")}…」` : "上一条消息";
+    await quietly(postMessage(f.channelId, `⚠️ 我对${where}的回复被桥接重启打断了，没回完，麻烦再发一次。`, toMain), "打断提示");
+    if (f.messageId) {
+      await react(f.channelId, f.messageId, "👀", true);
+      await react(f.channelId, f.messageId, "❌");
+    }
+    delete state.twoBInFlight[key];
+  }
+  await saveState();
 }
 
 async function reset2b() {
@@ -1523,5 +1544,6 @@ for (;;) {
 }
 await saveState();
 startApiServer();
+await reportInterrupted2b();
 console.log(`[discord_bridge] 启动，会话 ${Object.keys(state.sessions).length} 个，inbox 从第 ${state.inboxLines} 行开始`);
 setInterval(() => tick().catch((e) => console.error("[tick]", e.message)), POLL_MS);

@@ -11,7 +11,9 @@ const API = process.env.DISCORD_BRIDGE_API || "http://127.0.0.1:8793";
 const TOKEN_FILE = process.env.DISCORD_BRIDGE_TOKEN_FILE || "";
 const TARS = "http://127.0.0.1:8765";
 const TARS_START_SCRIPT = "C:\\Users\\13116\\ui-tars-local\\start-all.ps1";
-const TARS_WAIT_MS = 4 * 60 * 1000; // 超过这个时间就先返回 run_id，之后用 tars_status 查
+// 只等一小会儿：快的任务直接拿到结果；慢的先返回 run_id。tars-pilot 自己会在 Discord 发进度卡片、做完 @ 用户，
+// 2B 不用一直等着(以前等满 4 分钟，用户那边就是 4 分钟没回复)
+const TARS_WAIT_MS = 25 * 1000;
 
 const BROWSER_PORTS: Record<string, number> = { chrome: 9222, edge: 9223 };
 
@@ -180,7 +182,7 @@ export default function (pi: ExtensionAPI) {
       "让 tars-pilot 在自动化浏览器里操作网页(看截图定位按钮、点击、输入、读页面内容)，不占用用户的真实鼠标键盘。" +
       "二选一：recipe=模板名(配 vars) 或 task=自然语言任务描述。必须指定 cdp=要操作的标签页网址关键字。" +
       "小红书：browser='chrome', cdp='xiaohongshu.com'；其他所有网站：browser='edge'。" +
-      "最多等 4 分钟，没做完会返回 run_id 和 status=running，之后用 tars_status 查。",
+      "最多等 25 秒：快的任务直接返回结果；没做完会返回 run_id 和 status=running/queued，tars-pilot 会自己在 Discord 发进度卡片、做完 @ 用户，不用你盯。",
     parameters: Type.Object({
       task: Type.Optional(Type.String({ description: "自然语言任务，写清楚要做什么、做到哪一步算完成、要读回什么信息" })),
       recipe: Type.Optional(Type.String({ description: "模板名，来自 tars_recipes" })),
@@ -206,7 +208,7 @@ export default function (pi: ExtensionAPI) {
         const run = await tars("GET", `/runs/${runId}`);
         if (!["queued", "running"].includes(run.status)) return asResult(summarizeRun(run));
       }
-      return asResult({ run_id: runId, status: "running", note: "还没做完，稍后用 tars_status 查结果" });
+      return asResult({ run_id: runId, status: "running", note: "还在做。tars-pilot 会在这里发进度卡片，做完会 @ zym；你直接回复 zym 已经交出去了就行，别等" });
     },
   });
 
