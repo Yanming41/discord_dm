@@ -12,6 +12,8 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "discord.js": "^14.27.0"
+    "@resvg/resvg-js": "^2.6.2",
+    "discord.js": "^14.27.0",
+    "mathjax-full": "^3.2.1"
   }
 }

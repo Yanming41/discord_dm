@@ -33,6 +33,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadEnv } from "./load_env.mjs";
+import { hasMath, toDiscordSegments } from "./math_render.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -209,6 +210,49 @@ const stripAnsi = (t) => t.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
 // dinotty 读屏会在中文字符之间塞空格，这里还原
 const fixCjkSpacing = (t) => t.replace(/(?<=[　-鿿＀-￯])\s(?=[　-鿿＀-￯])/g, "");
 const toMain = { asClaude: false };
+
+// 带图片附件(公式图)的消息：webhook 和 bot 都用 multipart 上传
+function imageForm(content, images) {
+  const form = new FormData();
+  const names = images.map((_, i) => `formula${i + 1}.png`);
+  form.append("payload_json", JSON.stringify({ content, allowed_mentions: NO_MENTIONS, attachments: names.map((filename, id) => ({ id, filename })) }));
+  images.forEach((png, i) => form.append(`files[${i}]`, new Blob([png], { type: "image/png" }), names[i]));
+  return form;
+}
+
+async function postWithImages(channelId, content, images, { asClaude = true } = {}) {
+  if (asClaude && WEBHOOK_URL) {
+    const res = await fetch(`${WEBHOOK_URL}?wait=true&thread_id=${channelId}`, { method: "POST", body: imageForm(content, images) });
+    if (res.ok) return res.json();
+    console.error("[webhook] 带图发送失败，改用 bot 发:", res.status);
+  }
+  const res = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bot ${DISCORD_TOKEN}` },
+    body: imageForm(content, images),
+  });
+  if (!res.ok) throw new Error(`带图发送失败 HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return res.json();
+}
+
+// 发回复正文：有 LaTeX 公式时，单独成行的公式渲染成图片跟在对应文字后面，行内公式转成 Unicode(见 math_render.mjs)
+async function postRich(channelId, text, opts) {
+  if (!hasMath(text)) return postLong(channelId, text, opts);
+  let segments;
+  try {
+    segments = toDiscordSegments(text);
+  } catch (e) {
+    console.error("[公式] 处理失败，按原文发:", e.message);
+    return postLong(channelId, text, opts);
+  }
+  for (const seg of segments) {
+    const chunks = seg.text ? splitForDiscord(seg.text) : [""];
+    for (const chunk of chunks.slice(0, -1)) await postMessage(channelId, chunk, opts);
+    const last = chunks[chunks.length - 1];
+    if (seg.images.length) await postWithImages(channelId, last, seg.images, opts);
+    else if (last) await postMessage(channelId, last, opts);
+  }
+}
 
 const quietly = (p, what) => p.catch((e) => console.error(`[${what}]`, e.message));
 
@@ -558,7 +602,7 @@ async function runTurn(s, ev) {
     const reply = texts.join("\n\n") || "(Claude 这轮没有文字回复)";
     s.lastReply = reply.slice(0, 600);
     s.lastTurnEndedAt = Date.now();
-    await postLong(s.threadId, reply);
+    await postRich(s.threadId, reply);
     markTurnPosted(s, turnEndUuid);
     await react(s.threadId, ev.message_id, "⏳", true);
     await react(s.threadId, ev.message_id, "✅");
@@ -621,7 +665,7 @@ async function sweepSession(s) {
     if (e.type === "system" && e.subtype === "turn_duration") {
       if (!(s.postedTurns ?? []).includes(e.uuid) && (texts.length || tools)) {
         const reply = texts.join("\n\n") || "(这一轮没有文字回复)";
-        await postLong(s.threadId, `📬 **补发**：${describeTrigger(trigger)}\n\n${reply}`);
+        await postRich(s.threadId, `📬 **补发**：${describeTrigger(trigger)}\n\n${reply}`);
         s.lastReply = reply.slice(0, 600);
         s.lastTurnEndedAt = Date.now();
         markTurnPosted(s, e.uuid);
@@ -1325,7 +1369,7 @@ async function run2bTurn(ev, { channelId = DISCORD_CHANNEL_ID, inThread = false 
     const sessionId = twoBSessionFor(ch);
     await saveState();
     const reply = await runPi(`${prefix}${said || "(看附件)"}${attachmentNote(files)}`, images, sessionId, ch);
-    await postLong(ch, reply, toMain);
+    await postRich(ch, reply, toMain);
     await react(ch, ev.message_id, "👀", true);
     await react(ch, ev.message_id, "✅");
   } catch (e) {
