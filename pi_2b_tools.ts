@@ -89,6 +89,23 @@ async function call(method: string, route: string, body?: unknown) {
 const asResult = (json: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(json, null, 2) }], details: json });
 
 export default function (pi: ExtensionAPI) {
+  // pi 默认的系统提示词开头是 "You are an expert coding assistant…" 加 pi 文档索引和 skills 列表，
+  // 跟 2B 的前台秘书身份冲突、也用不上。换成一段简短的基础说明，只保留 2B 自己的提示词(--append-system-prompt 传进来的)。
+  pi.on("before_agent_start", async (ev: any) => {
+    const opts = ev.systemPromptOptions ?? {};
+    const appended = typeof opts.appendSystemPrompt === "string" ? opts.appendSystemPrompt : "";
+    if (!appended.includes("你是 2B")) return; // 拿不到 2B 的提示词就不动，免得变成空提示词
+    const base =
+      "你在 pi(一个 agent 运行框架)里运行，可以用工具读写本机文件、跑 bash 命令，以及调度 Claude Code 和 tars-pilot。" +
+      "文件操作(ls、rg、find)用 bash；看文件内容用 read；小改动用 edit，新文件或整体重写用 write。路径写清楚。";
+    const cwd = String(opts.cwd ?? process.cwd()).split("\\").join("/");
+    return { systemPrompt: `${base}
+
+${appended}
+
+Current working directory: ${cwd}` };
+  });
+
   pi.registerTool({
     name: "cc_status",
     label: "Claude Code 会话状态",
@@ -179,10 +196,8 @@ export default function (pi: ExtensionAPI) {
     name: "tars_run",
     label: "网页操作",
     description:
-      "让 tars-pilot 在自动化浏览器里操作网页(看截图定位按钮、点击、输入、读页面内容)，不占用用户的真实鼠标键盘。" +
-      "二选一：recipe=模板名(配 vars) 或 task=自然语言任务描述。必须指定 cdp=要操作的标签页网址关键字。" +
-      "小红书：browser='chrome', cdp='xiaohongshu.com'；其他所有网站：browser='edge'。" +
-      "最多等 25 秒：快的任务直接返回结果；没做完会返回 run_id 和 status=running/queued，tars-pilot 会自己在 Discord 发进度卡片、做完 @ 用户，不用你盯。",
+      "让 tars-pilot 在自动化浏览器里看截图操作网页(点击、输入、读内容)。二选一：recipe=模板名(配 vars) 或 task=自然语言任务；" +
+      "browser/cdp 的选法和等待规则见系统提示词「网页操作规则」。",
     parameters: Type.Object({
       task: Type.Optional(Type.String({ description: "自然语言任务，写清楚要做什么、做到哪一步算完成、要读回什么信息" })),
       recipe: Type.Optional(Type.String({ description: "模板名，来自 tars_recipes" })),
