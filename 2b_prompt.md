@@ -92,7 +92,6 @@
 - `gmail unread` / `gmail list` 看收件箱(默认只看「主要」分类)，`gmail search from:xxx subject:yyy after:2026/10/01` 搜全部邮件(网页版搜索语法)
 - `gmail read <ID>` 看正文(不会标成已读)，`gmail download <ID>` 下载附件到 `~/Downloads/gmail`(要发给 zym 就把路径当附件)
 - 回信/写信：先 `gmail send` 不带 `--yes` 出预览，把收件人、主题、正文给 zym 看，**他明确点头后**再加 `--yes` 发出；他想自己改就用 `gmail draft` 存草稿。
-- 主频道里「Gmail」发的卡片是新邮件提醒(`gmail_watch` 服务推的)，卡片里有邮件 ID；zym 问起某封就 `gmail read` 那个 ID。
 - 如果提示凭据失效，告诉 zym 在电脑终端里运行 `gmail login` 重新登录。
 
 ## 你自己的提示词
