@@ -34,6 +34,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadEnv } from "./load_env.mjs";
 import { hasMath, toDiscordSegments } from "./math_render.mjs";
+import { extractInteractive, buildComponents, copyParts } from "./reply_buttons.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -203,7 +204,9 @@ function splitForDiscord(text) {
 }
 
 async function postLong(channelId, text, opts) {
-  for (const chunk of splitForDiscord(text)) await postMessage(channelId, chunk, opts);
+  let last;
+  for (const chunk of splitForDiscord(text)) last = await postMessage(channelId, chunk, opts);
+  return last;
 }
 
 const stripAnsi = (t) => t.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
@@ -232,7 +235,7 @@ async function postWithImages(channelId, content, images, { asClaude = true } = 
     body: imageForm(content, images),
   });
   if (!res.ok) throw new Error(`带图发送失败 HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  return res.json();
+  return { ...(await res.json()), viaBot: true };
 }
 
 // 发回复正文：有 LaTeX 公式时，单独成行的公式渲染成图片跟在对应文字后面，行内公式转成 Unicode(见 math_render.mjs)
@@ -245,13 +248,100 @@ async function postRich(channelId, text, opts) {
     console.error("[公式] 处理失败，按原文发:", e.message);
     return postLong(channelId, text, opts);
   }
+  let lastMsg;
   for (const seg of segments) {
     const chunks = seg.text ? splitForDiscord(seg.text) : [""];
-    for (const chunk of chunks.slice(0, -1)) await postMessage(channelId, chunk, opts);
+    for (const chunk of chunks.slice(0, -1)) lastMsg = await postMessage(channelId, chunk, opts);
     const last = chunks[chunks.length - 1];
-    if (seg.images.length) await postWithImages(channelId, last, seg.images, opts);
-    else if (last) await postMessage(channelId, last, opts);
+    if (seg.images.length) lastMsg = await postWithImages(channelId, last, seg.images, opts);
+    else if (last) lastMsg = await postMessage(channelId, last, opts);
   }
+  return lastMsg;
+}
+
+// ---------- 回复里的按钮：选项(点了替 zym 发出那句话) 和 📋 复制(见 reply_buttons.mjs) ----------
+
+const BUTTONS_FILE = path.join(DATA_DIR, "bridge_buttons.json");
+const MAX_BUTTON_RECORDS = 300;
+let buttonRecords = {};
+try {
+  buttonRecords = JSON.parse(await readFile(BUTTONS_FILE, "utf8"));
+} catch {}
+
+async function saveButtons() {
+  const keys = Object.keys(buttonRecords);
+  if (keys.length > MAX_BUTTON_RECORDS) {
+    const oldest = keys.sort((a, b) => buttonRecords[a].ts - buttonRecords[b].ts).slice(0, keys.length - MAX_BUTTON_RECORDS);
+    for (const k of oldest) delete buttonRecords[k];
+  }
+  await writeFile(BUTTONS_FILE, JSON.stringify(buttonRecords), "utf8");
+}
+
+// 发 LLM 的回复：先拿掉 ```choices 块，正文照常发(公式渲染等)，再把按钮挂到最后一条消息上。
+// route：点了选项后这句话交给谁——"claude"(帖子里的 Claude) 或 "2b"
+async function postReply(channelId, text, opts, route) {
+  const { text: body, choices, blocks } = extractInteractive(text);
+  const last = await postRich(channelId, body || "选一个：", opts);
+  if ((!choices.length && !blocks.length) || !last?.id) return;
+  const key = randomBytes(5).toString("hex");
+  const rec = { channelId, route, msgId: last.id, viaBot: Boolean(last.viaBot), choices, blocks, ts: Date.now() };
+  buttonRecords[key] = rec;
+  await saveButtons();
+  await quietly(setComponents(rec, buildComponents(key, rec)), "挂按钮");
+}
+
+async function setComponents(rec, components) {
+  if (!rec.viaBot && WEBHOOK_URL) {
+    await http(`${WEBHOOK_URL}/messages/${rec.msgId}?thread_id=${rec.channelId}&with_components=true`, { method: "PATCH", body: { components } });
+  } else {
+    await discord("PATCH", `/channels/${rec.channelId}/messages/${rec.msgId}`, { components });
+  }
+}
+
+// 按钮点击：discord_dm 已经先 deferReply(只有自己可见)，这里用 interaction token 填内容
+const interactionUrl = (ia) => `https://discord.com/api/v10/webhooks/${ia.application_id}/${ia.token}`;
+const interactionReply = (ia, content) =>
+  http(`${interactionUrl(ia)}/messages/@original`, { method: "PATCH", body: { content, allowed_mentions: NO_MENTIONS } });
+const interactionFollowup = (ia, content) =>
+  http(interactionUrl(ia), { method: "POST", body: { content, flags: 64, allowed_mentions: NO_MENTIONS } });
+const interactionDelete = (ia) => http(`${interactionUrl(ia)}/messages/@original`, { method: "DELETE" });
+
+async function handleButton(ev) {
+  const [, kind, key, idx] = ev.custom_id.split(":");
+  const ia = ev.interaction;
+  const rec = buttonRecords[key];
+  if (ev.user_id && ev.user_id !== DISCORD_OWNER_ID) return interactionReply(ia, "这个按钮只有 zym 能点。");
+  if (!rec) return interactionReply(ia, "这个按钮已经过期了。");
+
+  if (kind === "cp") {
+    const parts = copyParts(rec.blocks);
+    await interactionReply(ia, parts[0]);
+    for (const p of parts.slice(1)) await interactionFollowup(ia, p);
+    return;
+  }
+
+  const choice = rec.choices[Number(idx)];
+  if (kind !== "ch" || !choice) return interactionReply(ia, "这个按钮不认识。");
+  if (rec.chosen != null) return interactionReply(ia, `已经选过「${rec.choices[rec.chosen].label}」了。`);
+  rec.chosen = Number(idx);
+  await saveButtons();
+  await quietly(interactionDelete(ia), "按钮回执");
+  await quietly(setComponents(rec, buildComponents(key, rec)), "禁用按钮");
+  // 在频道里留一条记录，说明这句话是点按钮发的；它也充当这条"消息"本身(👀 等表情加在它上面)
+  const quoted = choice.text === choice.label ? "" : `\n> ${choice.text.slice(0, 300).replace(/\n/g, "\n> ")}`;
+  const note = await postMessage(rec.channelId, `🔘 zym 选了：**${choice.label}**${quoted}`, toMain);
+  const inThread = rec.channelId !== DISCORD_CHANNEL_ID;
+  const content = rec.route === "2b" && inThread && BOT_USER_ID ? `<@${BOT_USER_ID}> ${choice.text}` : choice.text;
+  await handleMessage({
+    type: "message",
+    channel_id: rec.channelId,
+    thread_id: inThread ? rec.channelId : null,
+    content,
+    attachments: [],
+    message_id: note.id,
+    author_id: DISCORD_OWNER_ID,
+    ts: Date.now(),
+  });
 }
 
 const quietly = (p, what) => p.catch((e) => console.error(`[${what}]`, e.message));
@@ -355,7 +445,8 @@ async function ensurePane(s) {
   const resume = existsSync(transcriptPath(s));
   // 通过 cmd 给 Claude 设两个环境变量：它调用 tars-pilot(Python 客户端)时会自动带上，
   // tars-pilot 就把网页任务的进度卡片发到这个帖子里，不用 Claude 自己写频道(不占 token)
-  const claudeCmd = `claude ${resume ? "--resume" : "--session-id"} ${s.claudeSessionId}`;
+  // 帖子里的 Discord 用法说明(按钮、复制)；只对新会话生效——会话的系统提示词在第一次请求时就定下了
+  const claudeCmd = `claude ${resume ? "--resume" : "--session-id"} ${s.claudeSessionId} --append-system-prompt-file ${CC_PROMPT}`;
   const tab = await dinotty("POST", "/api/tabs", {
     cwd: s.cwd.replace(/\\/g, "/"),
     argv: ["cmd.exe", "/d", "/s", "/c", `set TARS_DISCORD_CHANNEL=${s.threadId}&& set TARS_CALLER=Claude Code&& ${claudeCmd}`],
@@ -602,7 +693,7 @@ async function runTurn(s, ev) {
     const reply = texts.join("\n\n") || "(Claude 这轮没有文字回复)";
     s.lastReply = reply.slice(0, 600);
     s.lastTurnEndedAt = Date.now();
-    await postRich(s.threadId, reply);
+    await postReply(s.threadId, reply, undefined, "claude");
     markTurnPosted(s, turnEndUuid);
     await react(s.threadId, ev.message_id, "⏳", true);
     await react(s.threadId, ev.message_id, "✅");
@@ -665,7 +756,7 @@ async function sweepSession(s) {
     if (e.type === "system" && e.subtype === "turn_duration") {
       if (!(s.postedTurns ?? []).includes(e.uuid) && (texts.length || tools)) {
         const reply = texts.join("\n\n") || "(这一轮没有文字回复)";
-        await postRich(s.threadId, `📬 **补发**：${describeTrigger(trigger)}\n\n${reply}`);
+        await postReply(s.threadId, `📬 **补发**：${describeTrigger(trigger)}\n\n${reply}`, undefined, "claude");
         s.lastReply = reply.slice(0, 600);
         s.lastTurnEndedAt = Date.now();
         markTurnPosted(s, e.uuid);
@@ -1269,6 +1360,7 @@ function twoBSessionFor(channelId) {
 const PI_CLI = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"), "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
 const TWOB_EXTENSION = path.join(__dirname, "pi_2b_tools.ts");
 const TWOB_PROMPT = path.join(__dirname, "2b_prompt.md");
+const CC_PROMPT = path.join(__dirname, "cc_discord_prompt.md");
 const TWOB_PROFILES = path.join(__dirname, "2b_profiles.md"); // 抽自 frontdesk.ts 的 PROMPT_PROFILES，按领域切换说话方式和规矩
 // 2B 的长期记忆：每次回复前作为系统提示词读进去，她用自己的编辑工具维护。是用户的个人数据，所以放仓库外。
 const TWOB_MEMORY = path.join(DATA_DIR, "2b_memory.md");
@@ -1369,7 +1461,7 @@ async function run2bTurn(ev, { channelId = DISCORD_CHANNEL_ID, inThread = false 
     const sessionId = twoBSessionFor(ch);
     await saveState();
     const reply = await runPi(`${prefix}${said || "(看附件)"}${attachmentNote(files)}`, images, sessionId, ch);
-    await postRich(ch, reply, toMain);
+    await postReply(ch, reply, toMain, "2b");
     await react(ch, ev.message_id, "👀", true);
     await react(ch, ev.message_id, "✅");
   } catch (e) {
@@ -1566,6 +1658,7 @@ async function tick() {
       try {
         const ev = JSON.parse(line);
         if (ev.type === "message") await handleMessage(ev);
+        else if (ev.type === "button_click" && ev.custom_id?.startsWith("br:")) await handleButton(ev);
       } catch (e) {
         console.error("[inbox] 处理出错:", e.message);
       }

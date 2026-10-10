@@ -64,7 +64,7 @@
 //
 // inbox 一行格式(按钮被点击时)：
 //   {
-//     "type": "button_click", "custom_id": "interested_xxx",
+//     "type": "button_click", "custom_id": "interested_xxx", "user_id", "channel_id", "message_id",
 //     "interaction": {"application_id":"...","token":"..."},  // 拿去构造上面第3种outbox写回复用
 //     "ts": 1234567890
 //   }
@@ -341,6 +341,9 @@ client.on("interactionCreate", async (interaction) => {
     JSON.stringify({
       type: "button_click",
       custom_id: interaction.customId,
+      user_id: interaction.user.id,
+      channel_id: interaction.channelId,
+      message_id: interaction.message?.id ?? null,
       interaction: { application_id: interaction.applicationId, token: interaction.token },
       ts: Date.now(),
     }) + "\n",
