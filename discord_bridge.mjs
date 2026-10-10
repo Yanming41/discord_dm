@@ -46,6 +46,7 @@ const WEBHOOK_FILE = path.join(DATA_DIR, "cc_webhook_url");
 const DINOTTY_TOKEN_FILE = path.join(process.env.APPDATA || path.join(HOME, "AppData", "Roaming"), "dinotty", "token");
 
 const DINOTTY = "http://127.0.0.1:8999";
+const CLAUDE_BIN = existsSync(path.join(HOME, ".local", "bin", "claude.exe")) ? path.join(HOME, ".local", "bin", "claude.exe") : "claude";
 const DEFAULT_CWD = HOME; // /cc 新开会话的工作目录；/resume 接上的会话用它自己原来的目录
 const PROJECTS_DIR = path.join(HOME, ".claude", "projects");
 const MAX_SESSIONS = 4;
@@ -446,7 +447,7 @@ async function ensurePane(s) {
   // 通过 cmd 给 Claude 设两个环境变量：它调用 tars-pilot(Python 客户端)时会自动带上，
   // tars-pilot 就把网页任务的进度卡片发到这个帖子里，不用 Claude 自己写频道(不占 token)
   // 帖子里的 Discord 用法说明(按钮、复制)；只对新会话生效——会话的系统提示词在第一次请求时就定下了
-  const claudeCmd = `claude ${resume ? "--resume" : "--session-id"} ${s.claudeSessionId} --append-system-prompt-file ${CC_PROMPT}`;
+  const claudeCmd = `${CLAUDE_BIN} ${resume ? "--resume" : "--session-id"} ${s.claudeSessionId} --append-system-prompt-file ${CC_PROMPT}`;
   const tab = await dinotty("POST", "/api/tabs", {
     cwd: s.cwd.replace(/\\/g, "/"),
     argv: ["cmd.exe", "/d", "/s", "/c", `set TARS_DISCORD_CHANNEL=${s.threadId}&& set TARS_CALLER=Claude Code&& ${claudeCmd}`],
