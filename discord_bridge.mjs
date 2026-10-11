@@ -386,6 +386,7 @@ function attachmentNote(files) {
 }
 
 async function react(channelId, messageId, emoji, remove = false) {
+  if (!messageId) return; // 桥接自己发起的轮次(比如 tars 回报)没有对应的 Discord 消息
   const route = `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`;
   await quietly(discord(remove ? "DELETE" : "PUT", route), `表情 ${emoji}`);
 }
@@ -770,6 +771,106 @@ async function sweepSession(s) {
     }
   }
 }
+
+// ---------- tars-pilot 回报：网页任务做完后，把结果交回调用它的 agent，由它决定下一步 ----------
+// 2B：tars_run 等不到结果时会调 /tars/watch 登记，做完马上在原处给 2B 发一轮「tars-pilot 回报」。
+// Claude：自动认出帖子里 Claude 发起的任务；做完 60 秒后，如果它的会话记录里没再提到这个任务
+// (说明它没自己去拿结果，比如 curl 等太久被掐断了)，就把回报作为一条消息发给它。
+
+const TARS_API = "http://127.0.0.1:8765";
+const TARS_POLL_MS = 15_000;
+const CLAUDE_REPORT_GRACE_MS = 60_000;
+state.tarsWatch ??= {}; // run_id -> { route: "2b" | "claude", channelId, addedAt }
+state.tarsHandled ??= []; // 已经处理过的 Claude 任务，避免重复回报
+state.tarsSeenSince ??= Date.now(); // 只管这之后创建的 Claude 任务
+
+const logLine = (l) => (typeof l === "string" ? l : JSON.stringify(l));
+
+function tarsReport(run, route) {
+  const r = run.result ?? {};
+  const lines = [
+    "[tars-pilot 自动回报，不是 zym 说的] 之前交给 tars-pilot 的网页任务结束了。",
+    `run_id=${run.id}　状态：${run.status}`,
+    `任务：${String(run.request?.task || `模板 ${run.request?.recipe}`).replace(/\s+/g, " ").slice(0, 300)}`,
+  ];
+  if (r.answer) lines.push(`${run.status === "done" ? "读回的结果" : "tars-pilot 的说明"}：${String(r.answer).slice(0, 1500)}`);
+  if (run.error) lines.push(`错误：${String(run.error).slice(0, 500)}`);
+  if (r.failedStep) lines.push(`卡在：${logLine(r.failedStep).slice(0, 300)}`);
+  const log = (run.log ?? []).slice(-6).map(logLine).join("\n").slice(-1200);
+  if (log) lines.push(`最后几步日志：\n${log}`);
+  lines.push(
+    route === "2b"
+      ? "请根据结果决定下一步：做完了就简短告诉 zym 结果；没成功但调整任务后有希望，就重新 tars_run；需要 zym 动手(登录、Duo、确认)就告诉他要做什么。"
+      : "请根据结果决定下一步：完成了就汇报；没成功就判断要不要调整后重新调用。"
+  );
+  return lines.join("\n");
+}
+
+async function claudeSawRun(s, runId, finishedAt) {
+  try {
+    const since = Date.parse(finishedAt) - 5000;
+    const lines = (await readFile(transcriptPath(s), "utf8")).split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const ts = Date.parse(lines[i].match(/"timestamp":"([^"]+)"/)?.[1] ?? "");
+      if (ts && ts < since) break;
+      if (lines[i].includes(runId)) return true;
+    }
+  } catch {}
+  return false;
+}
+
+async function pollTars() {
+  let runs;
+  try {
+    runs = await http(`${TARS_API}/runs`, { maxRetryWaitMs: 0 });
+  } catch {
+    return; // tars-pilot 没开
+  }
+  const byId = new Map(runs.map((r) => [r.id, r]));
+  const finished = (r) => !["queued", "running"].includes(r.status);
+  let changed = false;
+
+  for (const r of runs) {
+    const ch = r.request?.discord_channel_id;
+    if (r.request?.caller !== "Claude Code" || !state.sessions[ch] || Date.parse(r.createdAt) < state.tarsSeenSince) continue;
+    if (state.tarsWatch[r.id] || state.tarsHandled.includes(r.id)) continue;
+    state.tarsWatch[r.id] = { route: "claude", channelId: ch, addedAt: Date.now() };
+    changed = true;
+  }
+
+  for (const [id, w] of Object.entries(state.tarsWatch)) {
+    const run = byId.get(id);
+    if (!run) {
+      // tars-pilot 重启过，任务记录没了
+      delete state.tarsWatch[id];
+      changed = true;
+      continue;
+    }
+    if (!finished(run)) continue;
+    // 列表里不带日志，回报前取一次详情
+    const detail = () => http(`${TARS_API}/runs/${id}`, { maxRetryWaitMs: 0 }).catch(() => run);
+    if (w.route === "2b") {
+      delete state.tarsWatch[id];
+      changed = true;
+      const ev = { type: "message", channel_id: w.channelId, thread_id: null, content: tarsReport(await detail(), "2b"), attachments: [], message_id: null, author_id: DISCORD_OWNER_ID };
+      enqueue(twoBQueue(w.channelId), () => run2bTurn(ev, { channelId: w.channelId, inThread: false }));
+      continue;
+    }
+    if (Date.now() - Date.parse(run.finishedAt) < CLAUDE_REPORT_GRACE_MS) continue;
+    delete state.tarsWatch[id];
+    state.tarsHandled = [...state.tarsHandled, id].slice(-200);
+    changed = true;
+    const s = state.sessions[w.channelId];
+    if (!s || (await claudeSawRun(s, id, run.finishedAt))) continue;
+    console.log(`[tars 回报] ${id} → Claude ${s.threadId}`);
+    await quietly(postMessage(s.threadId, `📨 tars-pilot 的任务结束了（${run.status}），已把结果转给 Claude。`, toMain), "tars 回报提示");
+    const report = tarsReport(await detail(), "claude");
+    enqueue(s.threadId, () => runTurn(s, { content: report, message_id: null }));
+  }
+  if (changed) await saveState();
+}
+
+setInterval(() => pollTars().catch((e) => console.error("[tars 回报]", e.message)), TARS_POLL_MS);
 
 // 补发和正常对话走同一个帖子队列，不会和 runTurn 抢着发
 setInterval(() => {
@@ -1570,6 +1671,13 @@ const apiRoutes = {
     return { thread_id: s.threadId, link: `<#${s.threadId}>` };
   },
   // 网页操作过程中需要用户马上看到的事(比如 Duo 匹配码)，不等 2B 这一轮回复完就先发到主频道
+  "POST /tars/watch": async (_q, b) => {
+    if (!b.run_id) throw new BridgeError("缺少 run_id");
+    const run = await http(`${TARS_API}/runs/${encodeURIComponent(b.run_id)}`);
+    state.tarsWatch[run.id] = { route: "2b", channelId: run.request?.discord_channel_id || DISCORD_CHANNEL_ID, addedAt: Date.now() };
+    await saveState();
+    return { watching: true };
+  },
   "POST /notify": async (_q, b) => {
     if (!b.text) throw new BridgeError("缺少 text");
     await postMessage(DISCORD_CHANNEL_ID, String(b.text).slice(0, 1900), toMain);

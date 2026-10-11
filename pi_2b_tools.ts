@@ -223,7 +223,15 @@ Current working directory: ${cwd}` };
         const run = await tars("GET", `/runs/${runId}`);
         if (!["queued", "running"].includes(run.status)) return asResult(summarizeRun(run));
       }
-      return asResult({ run_id: runId, status: "running", note: "还在做。tars-pilot 会在这里发进度卡片，做完会 @ zym；你直接回复 zym 已经交出去了就行，别等" });
+      // 跟桥接登记：做完后桥接会把结果作为一条「tars-pilot 回报」发给这里的 2B，由她决定下一步
+      const watched = await call("POST", "/tars/watch", { run_id: runId }).then(() => true, () => false);
+      return asResult({
+        run_id: runId,
+        status: "running",
+        note: watched
+          ? "还在做。tars-pilot 会在这里发进度卡片；做完后结果会作为一条「tars-pilot 回报」自动发给你，到时再决定下一步。现在直接回复 zym 已经交出去了就行，别等"
+          : "还在做。tars-pilot 会在这里发进度卡片，做完会 @ zym；你直接回复 zym 已经交出去了就行，别等",
+      });
     },
   });
 
