@@ -195,6 +195,15 @@ async function claudeMaterial(cut) {
   return parts.join("\n\n");
 }
 
+// ---------- 待办 ----------
+function todoMaterial() {
+  try {
+    return execFileSync("cmd", ["/c", "todo", "ls"], { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  } catch (e) {
+    return `(读不到待办：${String(e.stderr || e.message).trim().slice(0, 150)})`;
+  }
+}
+
 // ---------- 让 2B 写 ----------
 function runPi(prompt) {
   return new Promise((resolve, reject) => {
@@ -229,6 +238,7 @@ const INSTRUCTIONS = (label) => `现在是你写日记的时间。你是 zym 的
 - 素材很少就写短一点，没什么事就一两句话。
 - 如果素材里看得出 zym 当天的状态和心情(累、烦、开心、焦虑…)，写一节「## 今天的状态」，如实简短地记，不要说教、不要强行开导；看不出来就不写。
 - 最后写一节「## 2B 的想法」：大胆提优化建议和你的看法，比如哪里在浪费算力/token(重复调用、该用命令行却用了 tars、同一件事反复做)、哪里有重复或闲置的资源、哪个流程可以省事、他的做法或设计哪里可以改进。要具体、说清理由。确实没什么可说的就不写这一节。想改你自己的提示词属于 L3，只能在这里提议，不要动手。
+- 待办：提一下快到期或已过期的；拖了很久没动的可以在「2B 的想法」里提醒。
 - 如果有值得长期记住的(偏好、交代的事、正在跟进的事)，可以顺手更新 2b_memory.md(L1)。
 - 直接输出日记正文(Markdown)，第一行是「# ${label} 日记」，不要加任何前后说明。
 
