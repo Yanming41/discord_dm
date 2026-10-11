@@ -261,9 +261,10 @@ async function main() {
   BOT_ID = (await discord("GET", "/users/@me")).id;
   let cut = 400;
   let material;
+  const todos = todoMaterial(); // 放在截断循环外，只读一次
   for (;;) {
     const [dc, git, cc] = await Promise.all([discordMaterial(cut), gitMaterial(), claudeMaterial(cut)]);
-    material = `# Discord\n${dc}\n\n# 当天的 git 提交\n${git}\n\n# 终端里直接用 Claude Code 时 zym 说的话\n${cc || "(没有)"}`;
+    material = `# Discord\n${dc}\n\n# 当天的 git 提交\n${git}\n\n# 终端里直接用 Claude Code 时 zym 说的话\n${cc || "(没有)"}\n\n# 当前待办(Microsoft To Do，未完成的)\n${todos}`;
     if (material.length <= MATERIAL_LIMIT || cut <= 80) break;
     cut = Math.floor(cut / 2);
   }
