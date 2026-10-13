@@ -806,6 +806,43 @@ function tarsReport(run, route) {
   return lines.join("\n");
 }
 
+// tars 批次汇总卡上的「📂 展开明细」和翻页按钮(custom_id = tb:<批次key>:<页码>)：
+// 读 tars 的 GET /batches/:key，弹一条只有 zym 能看到的明细，新的在前
+const BATCH_PAGE_SIZE = 15;
+const clockTime = (iso) => new Date(iso).toLocaleTimeString("zh-CN", { hour12: false });
+
+async function handleTarsBatchButton(ev) {
+  const [, key, pageText] = ev.custom_id.split(":");
+  const ia = ev.interaction;
+  if (ev.user_id && ev.user_id !== DISCORD_OWNER_ID) return interactionReply(ia, "这个按钮只有 zym 能点。");
+  let batch;
+  try {
+    batch = await http(`${TARS_API}/batches/${encodeURIComponent(key)}`, { maxRetryWaitMs: 0 });
+  } catch {
+    return interactionReply(ia, "查不到这个批次了（tars-pilot 重启过，明细没保留下来）。");
+  }
+  const pages = Math.max(1, Math.ceil(batch.entries.length / BATCH_PAGE_SIZE));
+  const page = Math.min(Math.max(0, Number(pageText) || 0), pages - 1);
+  const icon = { done: "✅", cancelled: "⏹", queued: "🕒", running: "⏳" };
+  const rows = batch.entries.slice(page * BATCH_PAGE_SIZE, (page + 1) * BATCH_PAGE_SIZE).map((e) => {
+    const took = e.durationMs != null ? `${(e.durationMs / 1000).toFixed(1)}秒` : e.status === "running" ? "进行中" : "排队中";
+    const line = `${icon[e.status] ?? "❌"} ${clockTime(e.createdAt)} · ${took} · ${e.desc}`;
+    return e.status !== "done" && e.answer ? `${line}\n　↳ ${e.answer.slice(0, 150)}` : line;
+  });
+  const c = batch.counts;
+  const head = `**📂 ${batch.title || "批量网页任务"}**\n共 ${c.total} 次（✅ ${c.done} ❌ ${c.failed}${c.cancelled ? ` ⏹ ${c.cancelled}` : ""}）· 第 ${page + 1}/${pages} 页，新的在前`;
+  let content = `${head}\n\n${rows.join("\n")}`;
+  if (content.length > 1990) content = `${content.slice(0, 1980)}…`;
+  const nav = [
+    { type: 2, style: 2, label: "◀ 更新", custom_id: `tb:${key}:${page - 1}`, disabled: page === 0 },
+    { type: 2, style: 2, label: "更早 ▶", custom_id: `tb:${key}:${page + 1}`, disabled: page >= pages - 1 },
+  ];
+  await http(`${interactionUrl(ia)}/messages/@original`, {
+    method: "PATCH",
+    body: { content, allowed_mentions: NO_MENTIONS, components: pages > 1 ? [{ type: 1, components: nav }] : [] },
+  });
+}
+
 async function claudeSawRun(s, runId, finishedAt) {
   try {
     const since = Date.parse(finishedAt) - 5000;
@@ -1768,6 +1805,7 @@ async function tick() {
         const ev = JSON.parse(line);
         if (ev.type === "message") await handleMessage(ev);
         else if (ev.type === "button_click" && ev.custom_id?.startsWith("br:")) await handleButton(ev);
+        else if (ev.type === "button_click" && ev.custom_id?.startsWith("tb:")) await handleTarsBatchButton(ev);
       } catch (e) {
         console.error("[inbox] 处理出错:", e.message);
       }
