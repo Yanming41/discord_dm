@@ -448,7 +448,7 @@ async function ensurePane(s) {
   // 通过 cmd 给 Claude 设两个环境变量：它调用 tars-pilot(Python 客户端)时会自动带上，
   // tars-pilot 就把网页任务的进度卡片发到这个帖子里，不用 Claude 自己写频道(不占 token)
   // 帖子里的 Discord 用法说明(按钮、复制)；只对新会话生效——会话的系统提示词在第一次请求时就定下了
-  const claudeCmd = `${CLAUDE_BIN} ${resume ? "--resume" : "--session-id"} ${s.claudeSessionId} --append-system-prompt-file ${CC_PROMPT}`;
+  const claudeCmd = `${CLAUDE_BIN} ${resume ? "--resume" : "--session-id"} ${s.claudeSessionId} --append-system-prompt-file ${CC_PROMPT} --settings ${PERMISSION_SETTINGS}`;
   const tab = await dinotty("POST", "/api/tabs", {
     cwd: s.cwd.replace(/\\/g, "/"),
     argv: ["cmd.exe", "/d", "/s", "/c", `set TARS_DISCORD_CHANNEL=${s.threadId}&& set TARS_CALLER=Claude Code&& ${claudeCmd}`],
@@ -804,6 +804,101 @@ function tarsReport(run, route) {
       : "请根据结果决定下一步：完成了就汇报；没成功就判断要不要调整后重新调用。"
   );
   return lines.join("\n");
+}
+
+// ---------- 权限确认：Claude 要权限时在帖子里发按钮，zym 点了就回给 permission_hook.mjs ----------
+// 桥接开的 Claude 都带 --settings PERMISSION_SETTINGS，里面挂了 PermissionRequest 钩子。
+// 钩子 POST /permission/ask 交请求，再轮询 GET /permission?key= 拿结果；10 分钟没点就转回终端弹框。
+
+const PERMISSION_SETTINGS = path.join(DATA_DIR, "cc_permission_settings.json");
+await writeFile(
+  PERMISSION_SETTINGS,
+  JSON.stringify({
+    hooks: {
+      PermissionRequest: [
+        { matcher: "*", hooks: [{ type: "command", command: `node ${path.join(__dirname, "permission_hook.mjs").replace(/\\/g, "/")}`, timeout: 600 }] },
+      ],
+    },
+  }),
+  "utf-8"
+);
+
+const PERMISSION_EXPIRE_MS = 580_000;
+const permissions = new Map(); // key -> { threadId, msgId, viaBot, decision, text, choices }
+
+function describePermission(b) {
+  const input = b.tool_input ?? {};
+  const tool = b.mcp_server ? `${b.tool_name}（MCP ${b.mcp_server}）` : b.tool_name;
+  const lines = [`🔐 <@${DISCORD_OWNER_ID}> Claude 要权限：**${tool}**`];
+  if (input.description) lines.push(`> ${String(input.description).slice(0, 200)}`);
+  const body =
+    input.command ?? input.file_path ?? input.url ?? input.pattern ?? JSON.stringify(input, null, 1);
+  lines.push("```\n" + String(body).replace(/```/g, "ˋˋˋ").slice(0, 1200) + "\n```");
+  const rules = (b.permission_suggestions ?? []).flatMap((s) =>
+    s.type === "addRules" ? (s.rules ?? []).map((r) => `${r.toolName}${r.ruleContent ? `(${r.ruleContent})` : ""}`) : s.type === "setMode" ? [`切到 ${s.mode} 模式`] : []
+  );
+  if (rules.length) lines.push(`-# 「以后不再问」会加上：${rules.join("、").slice(0, 200)}`);
+  return lines.join("\n");
+}
+
+function permissionButtons(key, rec) {
+  const decided = rec.decision != null;
+  const btn = (id, label, style) => ({
+    type: 2,
+    label,
+    custom_id: `pm:${key}:${id}`,
+    style: decided ? (rec.decision === id ? style : 2) : style,
+    disabled: decided,
+  });
+  const row = [btn("allow", "✅ 允许", 3)];
+  if (rec.canAlways) row.push(btn("always", "允许，以后不再问", 1));
+  row.push(btn("deny", "❌ 拒绝", 4));
+  return [{ type: 1, components: row }];
+}
+
+async function settlePermission(key, decision) {
+  const rec = permissions.get(key);
+  if (!rec || rec.decision != null) return;
+  rec.decision = decision;
+  clearTimeout(rec.timer);
+  const verdict = { allow: "✅ 已允许", always: "✅ 已允许，以后不再问", deny: "❌ 已拒绝", expired: "⌛ 10 分钟没确认，已转回终端弹框" }[decision];
+  await quietly(
+    discord("PATCH", `/channels/${rec.threadId}/messages/${rec.msgId}`, {
+      content: `${rec.text}\n**${verdict}**`.replace(`<@${DISCORD_OWNER_ID}> `, ""),
+      components: permissionButtons(key, rec),
+      allowed_mentions: NO_MENTIONS,
+    }),
+    "权限消息"
+  );
+  setTimeout(() => permissions.delete(key), 120_000).unref?.();
+}
+
+async function askPermission(b) {
+  const s = Object.values(state.sessions).find((x) => x.claudeSessionId === b.session_id);
+  if (!s) return { key: null }; // 不是桥接开的会话
+  const key = randomBytes(5).toString("hex");
+  const rec = { threadId: s.threadId, decision: null, text: describePermission(b), canAlways: Boolean(b.permission_suggestions?.length) };
+  permissions.set(key, rec);
+  const msg = await discord("POST", `/channels/${s.threadId}/messages`, {
+    content: rec.text,
+    components: permissionButtons(key, rec),
+    allowed_mentions: { users: [DISCORD_OWNER_ID] },
+  });
+  rec.msgId = msg.id;
+  rec.timer = setTimeout(() => settlePermission(key, "expired"), PERMISSION_EXPIRE_MS);
+  rec.timer.unref?.();
+  return { key };
+}
+
+async function handlePermissionButton(ev) {
+  const [, key, choice] = ev.custom_id.split(":");
+  const ia = ev.interaction;
+  if (ev.user_id && ev.user_id !== DISCORD_OWNER_ID) return interactionReply(ia, "这个按钮只有 zym 能点。");
+  const rec = permissions.get(key);
+  if (!rec) return interactionReply(ia, "这个请求已经失效了（可能桥接重启过，去终端里看看）。");
+  if (rec.decision != null) return interactionReply(ia, "这个请求已经处理过了。");
+  await quietly(interactionDelete(ia), "按钮回执");
+  await settlePermission(key, choice);
 }
 
 // tars 批次汇总卡上的「📂 展开明细」和翻页按钮(custom_id = tb:<批次key>:<页码>)：
@@ -1708,6 +1803,12 @@ const apiRoutes = {
     return { thread_id: s.threadId, link: `<#${s.threadId}>` };
   },
   // 网页操作过程中需要用户马上看到的事(比如 Duo 匹配码)，不等 2B 这一轮回复完就先发到主频道
+  "POST /permission/ask": async (_q, b) => askPermission(b),
+  "GET /permission": async (q) => ({ decision: permissions.get(q.key)?.decision ?? (permissions.has(q.key) ? null : "expired") }),
+  "POST /permission/expire": async (_q, b) => {
+    await settlePermission(b.key, "expired");
+    return { ok: true };
+  },
   "POST /tars/watch": async (_q, b) => {
     if (!b.run_id) throw new BridgeError("缺少 run_id");
     const run = await http(`${TARS_API}/runs/${encodeURIComponent(b.run_id)}`);
@@ -1806,6 +1907,7 @@ async function tick() {
         if (ev.type === "message") await handleMessage(ev);
         else if (ev.type === "button_click" && ev.custom_id?.startsWith("br:")) await handleButton(ev);
         else if (ev.type === "button_click" && ev.custom_id?.startsWith("tb:")) await handleTarsBatchButton(ev);
+        else if (ev.type === "button_click" && ev.custom_id?.startsWith("pm:")) await handlePermissionButton(ev);
       } catch (e) {
         console.error("[inbox] 处理出错:", e.message);
       }
